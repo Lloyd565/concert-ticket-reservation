@@ -1,0 +1,40 @@
+# Local stack. P0 scope: Postgres + Booking only.
+# Auth, Gateway, Payment, Notification, Redis, RabbitMQ, Jaeger, Prometheus,
+# Grafana and the seed job are added in their own phases (P1-P5).
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${BOOKING_DB_NAME:-booking_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${BOOKING_DB_NAME:-booking_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  booking:
+    build: ./services/booking
+    environment:
+      BOOKING_HTTP_PORT: "8080"
+      BOOKING_DATABASE_URL: ${BOOKING_DATABASE_URL:-postgres://postgres:postgres@postgres:5432/booking_db?sslmode=disable}
+    ports:
+      - "${BOOKING_HTTP_PORT:-8080}:8080"
+    depends_on:
+      postgres:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+volumes:
+  pgdata:
