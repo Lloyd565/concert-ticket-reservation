@@ -1,0 +1,54 @@
+syntax = "proto3";
+
+// Booking service contract. P1 exposes exactly the two operations the gateway
+// routes today; the seat-state authority's own logic is untouched by this file.
+package booking.v1;
+
+import "google/protobuf/timestamp.proto";
+
+option go_package = "github.com/lloyd565/concert-ticket-reservation/proto/booking/v1;bookingv1";
+
+message Seat {
+  string id = 1;
+  string section = 2;
+  string row = 3;
+  string number = 4;
+  string status = 5;
+}
+
+message SeedEventRequest {
+  string name = 1;
+  google.protobuf.Timestamp starts_at = 2;
+  repeated string sections = 3;
+  int32 rows = 4;
+  int32 seats_per_row = 5;
+}
+
+message SeedEventResponse {
+  string event_id = 1;
+  string name = 2;
+  google.protobuf.Timestamp starts_at = 3;
+  repeated Seat seats = 4;
+}
+
+message HoldSeatsRequest {
+  string event_id = 1;
+  repeated string seat_ids = 2;
+  // The authenticated subject. The gateway takes this from the validated
+  // access token and overwrites whatever the client sent, so a caller cannot
+  // hold seats in someone else's name.
+  string user_id = 3;
+  // Required (AGENTS.md §2 rule 10). Replaying a key returns the original
+  // reservation rather than claiming a second set of seats.
+  string idempotency_key = 4;
+}
+
+message HoldSeatsResponse {
+  string reservation_id = 1;
+  google.protobuf.Timestamp expires_at = 2;
+}
+
+service BookingService {
+  rpc SeedEvent(SeedEventRequest) returns (SeedEventResponse);
+  rpc HoldSeats(HoldSeatsRequest) returns (HoldSeatsResponse);
+}
