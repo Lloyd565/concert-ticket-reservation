@@ -57,8 +57,8 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 			key := uuid.Must(uuid.NewV7()).String()
 			ready.Done()
 			<-start
-			id, _, err := f.holder.HoldSeats(ctx, eventID, []string{seatID}, userID, key)
-			outcomes[i] = outcome{reservationID: id, err: err}
+			held, err := f.holder.HoldSeats(ctx, eventID, []string{seatID}, userID, key)
+			outcomes[i] = outcome{reservationID: held.ReservationID, err: err}
 		}(i)
 	}
 
@@ -171,7 +171,7 @@ func TestHoldSeatsConcurrentMultiSeat(t *testing.T) {
 			key := uuid.Must(uuid.NewV7()).String()
 			ready.Done()
 			<-start
-			_, _, err := f.holder.HoldSeats(ctx, ev.ID, order, userID, key)
+			_, err := f.holder.HoldSeats(ctx, ev.ID, order, userID, key)
 			errs[i] = err
 		}(i, order)
 	}
