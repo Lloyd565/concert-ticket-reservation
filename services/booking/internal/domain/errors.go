@@ -60,3 +60,50 @@ var ErrReservationNotFound = errors.New("reservation not found")
 // ErrDuplicateRequest means an identical idempotency key is being processed
 // concurrently. The retry is safe to repeat once the first one settles.
 var ErrDuplicateRequest = errors.New("duplicate request in flight")
+
+// Saga errors (P2).
+var (
+	// ErrNotReservationOwner means the caller is not the user who holds the
+	// reservation. A reservation ID is not a capability: knowing one must not
+	// be enough to pay for, confirm or cancel somebody else's seats.
+	ErrNotReservationOwner = errors.New("reservation belongs to another user")
+
+	// ErrReservationNotPayable means the reservation is not in a state a
+	// payment can be made against - already confirmed, failed, or expired
+	// (FR-4.2).
+	ErrReservationNotPayable = errors.New("reservation is not payable")
+
+	// ErrPaymentDeclined means the provider definitively refused. The seats
+	// have been released and the reservation failed by the time a caller sees
+	// this, so it is a settled outcome, not a retryable one.
+	ErrPaymentDeclined = errors.New("payment declined")
+
+	// ErrPaymentOutcomeUnknown is the D8 error, and the most important one in
+	// this package.
+	//
+	// It means the payment call did not complete: it timed out, the connection
+	// dropped, or the circuit breaker was open. It does NOT mean the payment
+	// failed. The money may have moved. Nothing may release the seats on this
+	// error - the reservation stays pending, marked for reconciliation, and the
+	// reconciliation job resolves it against Payment by idempotency key.
+	//
+	// Every time this sentinel is handled, the correct action is to do nothing
+	// to seat state. If a code path handling it releases a seat, that path is
+	// wrong regardless of what else it does.
+	ErrPaymentOutcomeUnknown = errors.New("payment outcome unknown; left for reconciliation")
+
+	// ErrConfirmUnrecoverable means a paid reservation can never be confirmed:
+	// its checkout window closed and its seats are gone, or they are no longer
+	// in a state that can become booked. It is the trigger for the automatic
+	// refund that keeps FR-5.3 true - there is no such thing as a customer who
+	// paid and got nothing.
+	ErrConfirmUnrecoverable = errors.New("reservation can no longer be confirmed")
+
+	// ErrBookingNotFound means no booking exists for the lookup.
+	ErrBookingNotFound = errors.New("booking not found")
+
+	// ErrBookingExists means the reservation already has a booking. Raised by
+	// the bookings.reservation_id UNIQUE constraint, which is the last line of
+	// defence against a retry issuing a second set of tickets.
+	ErrBookingExists = errors.New("booking already exists for this reservation")
+)

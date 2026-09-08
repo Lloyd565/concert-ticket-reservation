@@ -19,8 +19,10 @@ func TestSeatValidTransitions(t *testing.T) {
 	if err := s.Confirm(); err != nil {
 		t.Fatalf("confirm held seat: %v", err)
 	}
-	if s.Status != SeatBooked || s.HeldUntil != nil {
-		t.Fatalf("confirm should clear the deadline: %+v", s)
+	// Both pieces of hold metadata go: a booked seat is claimed permanently,
+	// and the database CHECK requires a non-held seat to carry neither.
+	if s.Status != SeatBooked || s.HeldUntil != nil || s.HeldBy != "" {
+		t.Fatalf("confirm should clear the hold metadata: %+v", s)
 	}
 	if err := s.Refund(); err != nil {
 		t.Fatalf("refund booked seat: %v", err)

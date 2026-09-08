@@ -40,6 +40,9 @@ type Seat struct {
 	Status    SeatStatus
 	HeldBy    string     // reservation ID holding this seat; empty unless held
 	HeldUntil *time.Time // expiry of the current hold; nil unless held
+	// PriceCents is what this seat costs. Integer cents; money is never a
+	// float (AGENTS.md §5).
+	PriceCents int64
 }
 
 // Available reports whether the seat can currently be claimed.
@@ -56,12 +59,18 @@ func (s *Seat) Hold(reservationID string, until time.Time) error {
 	return nil
 }
 
-// Confirm moves a held seat to booked. The hold metadata is cleared because a
-// booked seat is claimed permanently, not until a deadline.
+// Confirm moves a held seat to booked. Both pieces of hold metadata are
+// cleared: a booked seat is claimed permanently, not until a deadline, and the
+// claim is recorded by the booking and reservation_seats rows rather than by a
+// pointer on the seat. The database says the same thing - its
+// seats_hold_metadata_consistent check requires a non-held seat to carry
+// neither - so leaving HeldBy set here would make the entity disagree with the
+// row it is about to be written to.
 func (s *Seat) Confirm() error {
 	if err := s.transition(SeatBooked); err != nil {
 		return err
 	}
+	s.HeldBy = ""
 	s.HeldUntil = nil
 	return nil
 }
