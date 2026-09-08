@@ -105,14 +105,17 @@ Every synchronous call carries: a deadline/timeout, bounded retries with exponen
 
 Contracts live in `proto/`, one package per service, and are compiled by `make proto`. Generated stubs are a shared Go module that each service depends on through a local `replace` directive; the consequence is that Docker build contexts are the repository root rather than the service directory.
 
-Services defined as of P1:
+Services defined as of P2:
 
 | Contract | RPCs | Called by |
 |---|---|---|
 | `auth.v1.AuthService` | `Register`, `Login`, `Refresh`, `Logout` | Gateway |
-| `booking.v1.BookingService` | `SeedEvent`, `HoldSeats` | Gateway |
+| `booking.v1.BookingService` | `SeedEvent`, `HoldSeats`, `PayReservation` | Gateway |
+| `payment.v1.PaymentService` | `Charge`, `GetCharge`, `Refund` | Booking |
 
 Booking exposes gRPC *in addition to* its REST handler, not instead of it. Both transports call the same use case; neither reimplements a seat-state rule. `HoldSeatsRequest.user_id` is set by the gateway from the validated token's subject and overwrites whatever the client sent — Booking is not the component that decides who the caller is.
+
+Booking's call to Payment carries a deadline and a circuit breaker (`services/booking/internal/breaker`) from P2, because the saga's compensation logic depends on being able to tell "no" apart from "we do not know" and a breaker's fast-fail is one of the ways "we do not know" arises. It carries no retry: the safe place to retry a charge is inside Payment, where the idempotency key is already being passed through to the provider.
 
 Retries and circuit breakers on the gateway's outbound calls are deferred to P5 with the rest of the resilience work. A retry added before the saga's idempotency story is complete would be a way to double-book, not a way to be resilient. Deadlines and correlation-ID propagation are in place from P1.
 
@@ -274,9 +277,30 @@ The reservation → payment → confirmation sequence spans Booking and Payment.
 | Payment succeeded but confirmation write fails | Reservation stays `pending`; reconciliation retries confirmation. If unrecoverable → automatic refund. Satisfies FR-5.3: never a paid-but-unbooked customer |
 | Refund requested on confirmed booking | Payment refunds → publishes `refund.completed` → Booking releases seats, booking → `refunded` |
 
+Each row is a separate named function in `services/booking/internal/usecase/saga.go`, not a branch of one handler: `ReleaseDeclined`, `LeavePendingForReconciliation`, the P0 `Sweeper`, `RefundUnconfirmable`, `ReleaseRefunded`. Row 5's *trigger* is the `refund.completed` event and arrives with the broker in P4; its action half is built in P2 because row 4 is unfinished without it.
+
+**The second way to violate D8.** The saga leaving a timed-out reservation `pending` is only half the rule. The P0 sweeper releases any `pending` reservation past `expires_at`, and from its point of view one of these is just an abandoned checkout — so left alone it would blind-release the seats ten minutes later, through a different code path. `reservations.payment_pending_since` marks a reservation whose payment outcome is unknown, and `ReleaseExpiredHolds` skips every row that carries it. Reconciliation is then the only owner of those seats, which is why its interval must stay well inside the hold TTL; Booking refuses to start if it does not.
+
 ### 6.3 Reconciliation job
 
 A periodic job scans reservations stuck in `pending` past a grace period and resolves each against the Payment service by idempotency key. This is what makes the "unknown outcome" case converge, and it is the difference between a Saga that looks right in a diagram and one that is actually correct.
+
+The charge's idempotency key is derived from the reservation ID (`reservation:<id>`) rather than chosen by the client. Two consequences: two different client keys for one reservation are still one charge, and the job can ask Payment what happened without Booking having stored anything at the moment things went wrong — which is precisely the moment a write is least likely to have succeeded.
+
+Payment answers with one of four things, each with exactly one correct action:
+
+| Answer | Action |
+|---|---|
+| `succeeded` | Confirm. If confirmation is impossible, refund (§6.2 row 4) |
+| `declined` / `failed` | Release the seats, reservation → `failed` (§6.2 row 1, resolved late) |
+| no charge under this key | Release the seats. The only evidence that makes releasing safe after a timeout |
+| `pending` | Payment holds a charge it never settled. **Re-drive it** under the same key, which settles it into one of the three above |
+
+The last row is what makes the job converge rather than poll. A charge left `pending` — Payment wrote the row, then its own provider call was interrupted — is not going to settle on its own: nothing else re-drives it, the sweeper is forbidden to touch the reservation, and the customer is left with a hold that never resolves. So reconciliation calls `Charge` again rather than only `GetCharge`. Payment resumes the existing charge instead of creating a second one and passes the same key to the provider, so no money moves twice (FR-4.5).
+
+**Compensation runs on a detached context.** Everything the saga writes after the payment call — the reconciliation mark, the confirmation, the release — uses `context.WithoutCancel` with its own deadline. The moment those writes are most likely to be skipped is when the request context has already been cancelled (the gateway's deadline fired, the customer closed the tab), which is exactly the moment a charge is most likely to be in flight. Inheriting that cancellation leaves the reservation pending with nothing marking it, and the sweeper then releases seats that may have been paid for: D8 violated by way of a context, with no code path that looks wrong.
+
+**Deadlines nest.** `BOOKING_PAYMENT_TIMEOUT` (3s) sits inside `GATEWAY_UPSTREAM_TIMEOUT` (5s). If the gateway gives up first, the customer gets a 504 instead of the `202 Accepted` that tells them the payment is still settling for a reservation that is alive and being reconciled.
 
 ## 7. Tech stack
 
@@ -327,7 +351,11 @@ seats         (id, event_id, section, row, number, tier_id, status,
                held_by_reservation, held_until, version)
                UNIQUE (event_id, section, row, number)
 reservations  (id, user_id, event_id, status, total_cents,
-               expires_at, idempotency_key UNIQUE, created_at)
+               expires_at, idempotency_key UNIQUE, created_at,
+               payment_pending_since)   -- set when the payment outcome is
+                                        -- unknown; while set, ONLY the
+                                        -- reconciliation job may release
+                                        -- these seats (D8)
 reservation_seats (reservation_id, seat_id)  PK(reservation_id, seat_id)
 bookings      (id, reservation_id UNIQUE, user_id, payment_id,
                confirmed_at, status)
@@ -345,6 +373,10 @@ refunds          (id, charge_id, amount_cents, status, provider_ref,
                   idempotency_key UNIQUE, created_at)
 outbox           (id, aggregate_id, event_type, payload, created_at, published_at)
 ```
+
+`charges.status` is `pending | succeeded | declined | failed`, and `pending` is not an implementation detail: it is written **before** the provider is called (FR-4.5) and left in place when the call does not answer. A caller reading `pending` has an unknown outcome, not a failed one — the distinction the whole saga rests on. The `outbox` tables in both services arrive with the relay in P4; there is no publisher before then.
+
+P2 prices a seat map at a flat per-seat rate (`seats.price_cents`), summed into `reservations.total_cents` under the same lock that claims the seats. `pricing_tiers` and `seats.tier_id` arrive with the organizer flow; nothing in the saga or in Payment changes when they do, because both already work from the stored total.
 
 ### notif_db
 ```
@@ -365,6 +397,10 @@ internal/
   usecase/                   — application services, orchestration, transaction boundaries
                                (depends on repository *interfaces*)
   repository/                — Postgres/Redis implementations of those interfaces
+  provider/                  — outbound adapters that are not databases
+                               (Payment only: the payment provider). Same layer
+                               as repository — imports domain and drivers,
+                               never usecase
   transport/
     grpc/                    — gRPC handlers
     http/                    — REST handlers (gateway-facing services only)
@@ -404,7 +440,9 @@ Three properties are deliberate:
 
 That is the whole of admin management. There is no promotion endpoint and no admin CLI — the bootstrap exists to satisfy PRD §7 criterion 5, not to become a user-administration surface.
 
-As of P1 that is: `postgres` (booking_db), `auth_db`, `booking`, `auth`, `gateway`. There are no `depends_on` edges between the three services — each waits only on its own database, and the gateway waits on nothing, because it dials its upstreams lazily. Starting them in any order, or starting the gateway with both upstreams down, is a supported configuration and is the compose-level expression of §3.3.
+As of P2 that is: `postgres` (booking_db), `auth_db`, `payment_db`, `booking`, `auth`, `payment`, `gateway`. There are no `depends_on` edges between the four services — each waits only on its own database, the gateway waits on nothing because it dials its upstreams lazily, and Booking does not wait on Payment for the same reason. Starting them in any order, or starting the gateway with every upstream down, is a supported configuration and is the compose-level expression of §3.3. Booking with Payment down serves seat maps and holds normally; only the pay step reports an unknown outcome, and reconciliation resolves those once Payment returns.
+
+`PAYMENT_PROVIDER_MODE` (`succeed` | `decline` | `hang`) selects how the mock provider answers. `hang` is the interesting one: it produces the unknown outcome D8 exists for, in a running stack, and lets an operator watch seats stay held and the reconciliation job — not the sweeper — resolve them.
 
 Each service has its own Dockerfile and its own CI pipeline. Independent deployability is the entire justification for this architecture — if services can only be released together, the split has bought nothing.
 
