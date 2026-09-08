@@ -86,7 +86,7 @@ func (r *Repo) LockSeatsForUpdate(ctx context.Context, eventID string, seatIDs [
 	}
 	seats := make([]domain.Seat, 0, len(rows))
 	for _, row := range rows {
-		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil))
+		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil, row.PriceCents))
 	}
 	return seats, nil
 }
@@ -120,7 +120,7 @@ func (r *Repo) ListSeatsByEvent(ctx context.Context, eventID string) ([]domain.S
 	}
 	seats := make([]domain.Seat, 0, len(rows))
 	for _, row := range rows {
-		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil))
+		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil, row.PriceCents))
 	}
 	return seats, nil
 }
@@ -144,6 +144,7 @@ func (r *Repo) CreateReservation(ctx context.Context, res domain.Reservation) er
 		UserID:         userID,
 		EventID:        eventID,
 		Status:         string(res.Status),
+		TotalCents:     res.TotalCents,
 		ExpiresAt:      res.ExpiresAt,
 		IdempotencyKey: res.IdempotencyKey,
 	})
@@ -200,13 +201,15 @@ func (r *Repo) FindReservationByIdempotencyKey(ctx context.Context, key string) 
 		return domain.Reservation{}, fmt.Errorf("load reservation seats: %w", err)
 	}
 	res := domain.Reservation{
-		ID:             row.ID.String(),
-		UserID:         row.UserID.String(),
-		EventID:        row.EventID.String(),
-		Status:         domain.ReservationStatus(row.Status),
-		ExpiresAt:      row.ExpiresAt,
-		IdempotencyKey: row.IdempotencyKey,
-		CreatedAt:      row.CreatedAt,
+		ID:                  row.ID.String(),
+		UserID:              row.UserID.String(),
+		EventID:             row.EventID.String(),
+		Status:              domain.ReservationStatus(row.Status),
+		TotalCents:          row.TotalCents,
+		ExpiresAt:           row.ExpiresAt,
+		IdempotencyKey:      row.IdempotencyKey,
+		CreatedAt:           row.CreatedAt,
+		PaymentPendingSince: row.PaymentPendingSince,
 	}
 	for _, id := range seatIDs {
 		res.SeatIDs = append(res.SeatIDs, id.String())
@@ -248,7 +251,7 @@ func (r *Repo) CreateSeats(ctx context.Context, seats []domain.Seat) error {
 		if err != nil {
 			return fmt.Errorf("parse event id: %w", err)
 		}
-		params = append(params, CreateSeatsParams{ID: id, EventID: eventID, Section: s.Section, Row: s.Row, Number: s.Number})
+		params = append(params, CreateSeatsParams{ID: id, EventID: eventID, Section: s.Section, Row: s.Row, Number: s.Number, PriceCents: s.PriceCents})
 	}
 	if _, err := r.q(ctx).CreateSeats(ctx, params); err != nil {
 		return fmt.Errorf("create seats: %w", err)
@@ -256,15 +259,16 @@ func (r *Repo) CreateSeats(ctx context.Context, seats []domain.Seat) error {
 	return nil
 }
 
-func toSeat(id, eventID uuid.UUID, section, row, number, status string, heldBy *uuid.UUID, heldUntil *time.Time) domain.Seat {
+func toSeat(id, eventID uuid.UUID, section, row, number, status string, heldBy *uuid.UUID, heldUntil *time.Time, priceCents int64) domain.Seat {
 	s := domain.Seat{
-		ID:        id.String(),
-		EventID:   eventID.String(),
-		Section:   section,
-		Row:       row,
-		Number:    number,
-		Status:    domain.SeatStatus(status),
-		HeldUntil: heldUntil,
+		ID:         id.String(),
+		EventID:    eventID.String(),
+		Section:    section,
+		Row:        row,
+		Number:     number,
+		Status:     domain.SeatStatus(status),
+		HeldUntil:  heldUntil,
+		PriceCents: priceCents,
 	}
 	if heldBy != nil {
 		s.HeldBy = heldBy.String()

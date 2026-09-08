@@ -10,6 +10,15 @@ import (
 	"github.com/google/uuid"
 )
 
+type Booking struct {
+	ID            uuid.UUID
+	ReservationID uuid.UUID
+	UserID        uuid.UUID
+	PaymentID     uuid.UUID
+	Status        string
+	ConfirmedAt   time.Time
+}
+
 type Event struct {
 	ID        uuid.UUID
 	Name      string
@@ -18,13 +27,15 @@ type Event struct {
 }
 
 type Reservation struct {
-	ID             uuid.UUID
-	UserID         uuid.UUID
-	EventID        uuid.UUID
-	Status         string
-	ExpiresAt      time.Time
-	IdempotencyKey string
-	CreatedAt      time.Time
+	ID                  uuid.UUID
+	UserID              uuid.UUID
+	EventID             uuid.UUID
+	Status              string
+	ExpiresAt           time.Time
+	IdempotencyKey      string
+	CreatedAt           time.Time
+	TotalCents          int64
+	PaymentPendingSince *time.Time
 }
 
 type ReservationSeat struct {
@@ -43,4 +54,13 @@ type Seat struct {
 	HeldByReservation *uuid.UUID
 	HeldUntil         *time.Time
 	CreatedAt         time.Time
+	PriceCents        int64
+}
+
+type Ticket struct {
+	ID        uuid.UUID
+	BookingID uuid.UUID
+	SeatID    uuid.UUID
+	QrCode    string
+	IssuedAt  time.Time
 }

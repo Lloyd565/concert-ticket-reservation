@@ -34,6 +34,7 @@ func (r iteratorForCreateSeats) Values() ([]interface{}, error) {
 		r.rows[0].Section,
 		r.rows[0].Row,
 		r.rows[0].Number,
+		r.rows[0].PriceCents,
 	}, nil
 }
 
@@ -43,5 +44,40 @@ func (r iteratorForCreateSeats) Err() error {
 
 // Bulk seat-map insert for seeding. pgx COPY, one round trip for the whole map.
 func (q *Queries) CreateSeats(ctx context.Context, arg []CreateSeatsParams) (int64, error) {
-	return q.db.CopyFrom(ctx, []string{"seats"}, []string{"id", "event_id", "section", "row", "number"}, &iteratorForCreateSeats{rows: arg})
+	return q.db.CopyFrom(ctx, []string{"seats"}, []string{"id", "event_id", "section", "row", "number", "price_cents"}, &iteratorForCreateSeats{rows: arg})
+}
+
+// iteratorForCreateTickets implements pgx.CopyFromSource.
+type iteratorForCreateTickets struct {
+	rows                 []CreateTicketsParams
+	skippedFirstNextCall bool
+}
+
+func (r *iteratorForCreateTickets) Next() bool {
+	if len(r.rows) == 0 {
+		return false
+	}
+	if !r.skippedFirstNextCall {
+		r.skippedFirstNextCall = true
+		return true
+	}
+	r.rows = r.rows[1:]
+	return len(r.rows) > 0
+}
+
+func (r iteratorForCreateTickets) Values() ([]interface{}, error) {
+	return []interface{}{
+		r.rows[0].ID,
+		r.rows[0].BookingID,
+		r.rows[0].SeatID,
+		r.rows[0].QrCode,
+	}, nil
+}
+
+func (r iteratorForCreateTickets) Err() error {
+	return nil
+}
+
+func (q *Queries) CreateTickets(ctx context.Context, arg []CreateTicketsParams) (int64, error) {
+	return q.db.CopyFrom(ctx, []string{"tickets"}, []string{"id", "booking_id", "seat_id", "qr_code"}, &iteratorForCreateTickets{rows: arg})
 }

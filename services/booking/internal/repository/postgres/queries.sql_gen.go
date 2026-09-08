@@ -29,6 +29,35 @@ func (q *Queries) AttachSeatsToReservation(ctx context.Context, arg AttachSeatsT
 	return err
 }
 
+const createBooking = `-- name: CreateBooking :exec
+INSERT INTO bookings (id, reservation_id, user_id, payment_id, status, confirmed_at)
+VALUES ($1, $2, $3, $4, $5, $6)
+`
+
+type CreateBookingParams struct {
+	ID            uuid.UUID
+	ReservationID uuid.UUID
+	UserID        uuid.UUID
+	PaymentID     uuid.UUID
+	Status        string
+	ConfirmedAt   time.Time
+}
+
+// The reservation_id UNIQUE constraint is what makes confirmation idempotent at
+// the database level: a retry, or reconciliation racing the live saga, collides
+// here instead of issuing a second set of tickets.
+func (q *Queries) CreateBooking(ctx context.Context, arg CreateBookingParams) error {
+	_, err := q.db.Exec(ctx, createBooking,
+		arg.ID,
+		arg.ReservationID,
+		arg.UserID,
+		arg.PaymentID,
+		arg.Status,
+		arg.ConfirmedAt,
+	)
+	return err
+}
+
 const createEvent = `-- name: CreateEvent :exec
 INSERT INTO events (id, name, starts_at)
 VALUES ($1, $2, $3)
@@ -46,8 +75,8 @@ func (q *Queries) CreateEvent(ctx context.Context, arg CreateEventParams) error 
 }
 
 const createReservation = `-- name: CreateReservation :exec
-INSERT INTO reservations (id, user_id, event_id, status, expires_at, idempotency_key)
-VALUES ($1, $2, $3, $4, $5, $6)
+INSERT INTO reservations (id, user_id, event_id, status, total_cents, expires_at, idempotency_key)
+VALUES ($1, $2, $3, $4, $5, $6, $7)
 `
 
 type CreateReservationParams struct {
@@ -55,6 +84,7 @@ type CreateReservationParams struct {
 	UserID         uuid.UUID
 	EventID        uuid.UUID
 	Status         string
+	TotalCents     int64
 	ExpiresAt      time.Time
 	IdempotencyKey string
 }
@@ -65,6 +95,7 @@ func (q *Queries) CreateReservation(ctx context.Context, arg CreateReservationPa
 		arg.UserID,
 		arg.EventID,
 		arg.Status,
+		arg.TotalCents,
 		arg.ExpiresAt,
 		arg.IdempotencyKey,
 	)
@@ -72,32 +103,109 @@ func (q *Queries) CreateReservation(ctx context.Context, arg CreateReservationPa
 }
 
 type CreateSeatsParams struct {
-	ID      uuid.UUID
-	EventID uuid.UUID
-	Section string
-	Row     string
-	Number  string
+	ID         uuid.UUID
+	EventID    uuid.UUID
+	Section    string
+	Row        string
+	Number     string
+	PriceCents int64
 }
 
-const getReservationByIdempotencyKey = `-- name: GetReservationByIdempotencyKey :one
-SELECT id, user_id, event_id, status, expires_at, idempotency_key, created_at
-FROM reservations
-WHERE idempotency_key = $1
+type CreateTicketsParams struct {
+	ID        uuid.UUID
+	BookingID uuid.UUID
+	SeatID    uuid.UUID
+	QrCode    string
+}
+
+const getBookingByReservation = `-- name: GetBookingByReservation :one
+SELECT id, reservation_id, user_id, payment_id, status, confirmed_at
+FROM bookings
+WHERE reservation_id = $1
 `
 
-// Idempotent retries (FR-3.7): the same key returns the first reservation
-// rather than claiming a second set of seats.
-func (q *Queries) GetReservationByIdempotencyKey(ctx context.Context, idempotencyKey string) (Reservation, error) {
-	row := q.db.QueryRow(ctx, getReservationByIdempotencyKey, idempotencyKey)
-	var i Reservation
+func (q *Queries) GetBookingByReservation(ctx context.Context, reservationID uuid.UUID) (Booking, error) {
+	row := q.db.QueryRow(ctx, getBookingByReservation, reservationID)
+	var i Booking
+	err := row.Scan(
+		&i.ID,
+		&i.ReservationID,
+		&i.UserID,
+		&i.PaymentID,
+		&i.Status,
+		&i.ConfirmedAt,
+	)
+	return i, err
+}
+
+const getReservationByID = `-- name: GetReservationByID :one
+SELECT id, user_id, event_id, status, total_cents, expires_at, idempotency_key, created_at, payment_pending_since
+FROM reservations
+WHERE id = $1
+`
+
+type GetReservationByIDRow struct {
+	ID                  uuid.UUID
+	UserID              uuid.UUID
+	EventID             uuid.UUID
+	Status              string
+	TotalCents          int64
+	ExpiresAt           time.Time
+	IdempotencyKey      string
+	CreatedAt           time.Time
+	PaymentPendingSince *time.Time
+}
+
+func (q *Queries) GetReservationByID(ctx context.Context, id uuid.UUID) (GetReservationByIDRow, error) {
+	row := q.db.QueryRow(ctx, getReservationByID, id)
+	var i GetReservationByIDRow
 	err := row.Scan(
 		&i.ID,
 		&i.UserID,
 		&i.EventID,
 		&i.Status,
+		&i.TotalCents,
 		&i.ExpiresAt,
 		&i.IdempotencyKey,
 		&i.CreatedAt,
+		&i.PaymentPendingSince,
+	)
+	return i, err
+}
+
+const getReservationByIdempotencyKey = `-- name: GetReservationByIdempotencyKey :one
+SELECT id, user_id, event_id, status, total_cents, expires_at, idempotency_key, created_at, payment_pending_since
+FROM reservations
+WHERE idempotency_key = $1
+`
+
+type GetReservationByIdempotencyKeyRow struct {
+	ID                  uuid.UUID
+	UserID              uuid.UUID
+	EventID             uuid.UUID
+	Status              string
+	TotalCents          int64
+	ExpiresAt           time.Time
+	IdempotencyKey      string
+	CreatedAt           time.Time
+	PaymentPendingSince *time.Time
+}
+
+// Idempotent retries (FR-3.7): the same key returns the first reservation
+// rather than claiming a second set of seats.
+func (q *Queries) GetReservationByIdempotencyKey(ctx context.Context, idempotencyKey string) (GetReservationByIdempotencyKeyRow, error) {
+	row := q.db.QueryRow(ctx, getReservationByIdempotencyKey, idempotencyKey)
+	var i GetReservationByIdempotencyKeyRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.EventID,
+		&i.Status,
+		&i.TotalCents,
+		&i.ExpiresAt,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.PaymentPendingSince,
 	)
 	return i, err
 }
@@ -129,8 +237,70 @@ func (q *Queries) GetReservationSeatIDs(ctx context.Context, reservationID uuid.
 	return items, nil
 }
 
+const listReservationsAwaitingReconciliation = `-- name: ListReservationsAwaitingReconciliation :many
+SELECT id, user_id, event_id, status, total_cents, expires_at, idempotency_key, created_at, payment_pending_since
+FROM reservations
+WHERE status = 'pending'
+  AND payment_pending_since IS NOT NULL
+  AND payment_pending_since <= $1
+ORDER BY payment_pending_since
+LIMIT $2
+`
+
+type ListReservationsAwaitingReconciliationParams struct {
+	OlderThan *time.Time
+	RowLimit  int32
+}
+
+type ListReservationsAwaitingReconciliationRow struct {
+	ID                  uuid.UUID
+	UserID              uuid.UUID
+	EventID             uuid.UUID
+	Status              string
+	TotalCents          int64
+	ExpiresAt           time.Time
+	IdempotencyKey      string
+	CreatedAt           time.Time
+	PaymentPendingSince *time.Time
+}
+
+// The reconciliation scan (ARCHITECTURE.md §6.3): reservations whose payment
+// outcome has been unknown for longer than the grace period.
+//
+// Oldest first, so the longest-stuck reservation is resolved first, and limited
+// so one sweep cannot stall on a backlog.
+func (q *Queries) ListReservationsAwaitingReconciliation(ctx context.Context, arg ListReservationsAwaitingReconciliationParams) ([]ListReservationsAwaitingReconciliationRow, error) {
+	rows, err := q.db.Query(ctx, listReservationsAwaitingReconciliation, arg.OlderThan, arg.RowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ListReservationsAwaitingReconciliationRow
+	for rows.Next() {
+		var i ListReservationsAwaitingReconciliationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.EventID,
+			&i.Status,
+			&i.TotalCents,
+			&i.ExpiresAt,
+			&i.IdempotencyKey,
+			&i.CreatedAt,
+			&i.PaymentPendingSince,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const listSeatsByEvent = `-- name: ListSeatsByEvent :many
-SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until
+SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until, price_cents
 FROM seats
 WHERE event_id = $1
 ORDER BY section, "row", number
@@ -145,6 +315,7 @@ type ListSeatsByEventRow struct {
 	Status            string
 	HeldByReservation *uuid.UUID
 	HeldUntil         *time.Time
+	PriceCents        int64
 }
 
 func (q *Queries) ListSeatsByEvent(ctx context.Context, eventID uuid.UUID) ([]ListSeatsByEventRow, error) {
@@ -165,6 +336,148 @@ func (q *Queries) ListSeatsByEvent(ctx context.Context, eventID uuid.UUID) ([]Li
 			&i.Status,
 			&i.HeldByReservation,
 			&i.HeldUntil,
+			&i.PriceCents,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const listTicketsByBooking = `-- name: ListTicketsByBooking :many
+SELECT id, booking_id, seat_id, qr_code, issued_at
+FROM tickets
+WHERE booking_id = $1
+ORDER BY seat_id
+`
+
+func (q *Queries) ListTicketsByBooking(ctx context.Context, bookingID uuid.UUID) ([]Ticket, error) {
+	rows, err := q.db.Query(ctx, listTicketsByBooking, bookingID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []Ticket
+	for rows.Next() {
+		var i Ticket
+		if err := rows.Scan(
+			&i.ID,
+			&i.BookingID,
+			&i.SeatID,
+			&i.QrCode,
+			&i.IssuedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
+const lockReservationForUpdate = `-- name: LockReservationForUpdate :one
+
+SELECT id, user_id, event_id, status, total_cents, expires_at, idempotency_key, created_at, payment_pending_since
+FROM reservations
+WHERE id = $1
+FOR UPDATE
+`
+
+type LockReservationForUpdateRow struct {
+	ID                  uuid.UUID
+	UserID              uuid.UUID
+	EventID             uuid.UUID
+	Status              string
+	TotalCents          int64
+	ExpiresAt           time.Time
+	IdempotencyKey      string
+	CreatedAt           time.Time
+	PaymentPendingSince *time.Time
+}
+
+// ---------------------------------------------------------------------------
+// P2: the reservation saga.
+//
+// Every statement below runs inside a transaction opened by usecase. The
+// ordering discipline is P0's, for P0's reason: the reservation row is locked
+// before the seats it owns, on every path, so two concurrent saga steps queue
+// instead of forming a waiting cycle.
+// ---------------------------------------------------------------------------
+//
+// Takes the reservation write lock and re-reads its state under it.
+//
+// Re-reading is the point. Between the payment call and this transaction the
+// sweeper may have expired the reservation, or a concurrent retry may have
+// confirmed it. The status read here is what the decision is made on; the
+// status the caller remembered from before the network hop is stale by
+// definition.
+func (q *Queries) LockReservationForUpdate(ctx context.Context, id uuid.UUID) (LockReservationForUpdateRow, error) {
+	row := q.db.QueryRow(ctx, lockReservationForUpdate, id)
+	var i LockReservationForUpdateRow
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.EventID,
+		&i.Status,
+		&i.TotalCents,
+		&i.ExpiresAt,
+		&i.IdempotencyKey,
+		&i.CreatedAt,
+		&i.PaymentPendingSince,
+	)
+	return i, err
+}
+
+const lockSeatsByReservation = `-- name: LockSeatsByReservation :many
+SELECT s.id, s.event_id, s.section, s."row", s.number, s.status, s.held_by_reservation, s.held_until, s.price_cents
+FROM seats s
+JOIN reservation_seats rs ON rs.seat_id = s.id
+WHERE rs.reservation_id = $1
+  AND rs.released_at IS NULL
+ORDER BY s.id
+FOR UPDATE OF s
+`
+
+type LockSeatsByReservationRow struct {
+	ID                uuid.UUID
+	EventID           uuid.UUID
+	Section           string
+	Row               string
+	Number            string
+	Status            string
+	HeldByReservation *uuid.UUID
+	HeldUntil         *time.Time
+	PriceCents        int64
+}
+
+// Locks every seat this reservation claims, in seat-ID order (D5). Same
+// ordering rule as the hold path, so a confirm, a release and a hold all walk
+// contended seat rows in the same sequence and no cycle can form between them.
+func (q *Queries) LockSeatsByReservation(ctx context.Context, reservationID uuid.UUID) ([]LockSeatsByReservationRow, error) {
+	rows, err := q.db.Query(ctx, lockSeatsByReservation, reservationID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []LockSeatsByReservationRow
+	for rows.Next() {
+		var i LockSeatsByReservationRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventID,
+			&i.Section,
+			&i.Row,
+			&i.Number,
+			&i.Status,
+			&i.HeldByReservation,
+			&i.HeldUntil,
+			&i.PriceCents,
 		); err != nil {
 			return nil, err
 		}
@@ -178,7 +491,7 @@ func (q *Queries) ListSeatsByEvent(ctx context.Context, eventID uuid.UUID) ([]Li
 
 const lockSeatsForUpdate = `-- name: LockSeatsForUpdate :many
 
-SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until
+SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until, price_cents
 FROM seats
 WHERE event_id = $1
   AND id = ANY ($2::uuid[])
@@ -200,6 +513,7 @@ type LockSeatsForUpdateRow struct {
 	Status            string
 	HeldByReservation *uuid.UUID
 	HeldUntil         *time.Time
+	PriceCents        int64
 }
 
 // Every query here is hand-written SQL compiled by sqlc into type-safe Go.
@@ -236,6 +550,7 @@ func (q *Queries) LockSeatsForUpdate(ctx context.Context, arg LockSeatsForUpdate
 			&i.Status,
 			&i.HeldByReservation,
 			&i.HeldUntil,
+			&i.PriceCents,
 		); err != nil {
 			return nil, err
 		}
@@ -245,6 +560,51 @@ func (q *Queries) LockSeatsForUpdate(ctx context.Context, arg LockSeatsForUpdate
 		return nil, err
 	}
 	return items, nil
+}
+
+const markPaymentPending = `-- name: MarkPaymentPending :execrows
+UPDATE reservations
+SET payment_pending_since = now()
+WHERE id = $1
+  AND status = 'pending'
+  AND payment_pending_since IS NULL
+`
+
+// Hands the reservation to the reconciliation job (D8). Until this is cleared,
+// neither the sweeper nor anything else may release these seats: a charge may
+// exist for them and nobody yet knows its outcome.
+//
+// Idempotent by construction. The first unknown outcome is the one that
+// matters, so a repeat leaves the original timestamp alone rather than pushing
+// the reconciliation grace period further into the future.
+func (q *Queries) MarkPaymentPending(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markPaymentPending, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const markSeatsBooked = `-- name: MarkSeatsBooked :execrows
+UPDATE seats
+SET status              = 'booked',
+    held_by_reservation = NULL,
+    held_until          = NULL
+WHERE held_by_reservation = $1
+  AND status = 'held'
+`
+
+// held -> booked. The hold metadata is cleared because a booked seat is claimed
+// permanently rather than until a deadline, and the seats_hold_metadata_consistent
+// constraint requires exactly that. status = 'held' is a tripwire: the caller
+// compares the row count against the seats it locked, so a seat that moved
+// underneath the transaction surfaces as an error, not a partial booking.
+func (q *Queries) MarkSeatsBooked(ctx context.Context, reservationID *uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, markSeatsBooked, reservationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }
 
 const markSeatsHeld = `-- name: MarkSeatsHeld :execrows
@@ -276,12 +636,41 @@ func (q *Queries) MarkSeatsHeld(ctx context.Context, arg MarkSeatsHeldParams) (i
 	return result.RowsAffected(), nil
 }
 
+const releaseBookedSeats = `-- name: ReleaseBookedSeats :execrows
+WITH released AS (
+    UPDATE reservation_seats rs
+    SET released_at = now()
+    WHERE rs.reservation_id = $1
+      AND rs.released_at IS NULL
+    RETURNING rs.seat_id
+)
+UPDATE seats s
+SET status              = 'available',
+    held_by_reservation = NULL,
+    held_until          = NULL
+FROM released r
+WHERE s.id = r.seat_id
+  AND s.status = 'booked'
+`
+
+// booked -> available, for a refund. Kept separate from ReleaseReservationSeats
+// because the state it moves from is different, and one statement accepting
+// either would happily release a seat from a state nobody intended.
+func (q *Queries) ReleaseBookedSeats(ctx context.Context, reservationID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseBookedSeats, reservationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const releaseExpiredHolds = `-- name: ReleaseExpiredHolds :execrows
 WITH expired AS (
     UPDATE reservations
     SET status = 'expired'
     WHERE status = 'pending'
       AND expires_at <= now()
+      AND payment_pending_since IS NULL
     RETURNING id
 ), released AS (
     UPDATE reservation_seats rs
@@ -307,8 +696,90 @@ WHERE s.id = r.seat_id
 // Chained CTEs run in a single snapshot: expire the pending reservations whose
 // checkout window closed, stamp their claims released (which frees the D13
 // index for the next holder), then return exactly those seats to available.
+//
+// payment_pending_since IS NULL is the D8 guard added in P2, and it is not
+// optional. A reservation whose payment outcome is unknown may already have
+// been charged; releasing its seats here would sell a seat the customer has
+// paid for - the exact mistake D8 forbids, reached through the sweeper rather
+// than through the saga. Those rows belong to the reconciliation job alone.
 func (q *Queries) ReleaseExpiredHolds(ctx context.Context) (int64, error) {
 	result, err := q.db.Exec(ctx, releaseExpiredHolds)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const releaseReservationSeats = `-- name: ReleaseReservationSeats :execrows
+WITH released AS (
+    UPDATE reservation_seats rs
+    SET released_at = now()
+    WHERE rs.reservation_id = $1
+      AND rs.released_at IS NULL
+    RETURNING rs.seat_id
+)
+UPDATE seats s
+SET status              = 'available',
+    held_by_reservation = NULL,
+    held_until          = NULL
+FROM released r
+WHERE s.id = r.seat_id
+  AND s.status = 'held'
+`
+
+// held -> available, with the claim stamped released so the D13 partial unique
+// index frees up for the next holder. One statement, so a claim can never be
+// stamped released while its seat stays held.
+func (q *Queries) ReleaseReservationSeats(ctx context.Context, reservationID uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, releaseReservationSeats, reservationID)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setBookingStatus = `-- name: SetBookingStatus :execrows
+UPDATE bookings
+SET status = $1
+WHERE id = $2
+  AND status = $3
+`
+
+type SetBookingStatusParams struct {
+	NewStatus     string
+	ID            uuid.UUID
+	CurrentStatus string
+}
+
+func (q *Queries) SetBookingStatus(ctx context.Context, arg SetBookingStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setBookingStatus, arg.NewStatus, arg.ID, arg.CurrentStatus)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const setReservationStatus = `-- name: SetReservationStatus :execrows
+UPDATE reservations
+SET status = $1,
+    -- Reaching a terminal state settles any payment doubt by definition.
+    payment_pending_since = NULL
+WHERE id = $2
+  AND status = $3
+`
+
+type SetReservationStatusParams struct {
+	NewStatus     string
+	ID            uuid.UUID
+	CurrentStatus string
+}
+
+// @current_status is the guard. Transitions are one-way (FR-5.1), and naming the state
+// being left means a concurrent writer that already moved the row cannot be
+// silently overwritten: the row count comes back zero and the caller knows it
+// lost the race.
+func (q *Queries) SetReservationStatus(ctx context.Context, arg SetReservationStatusParams) (int64, error) {
+	result, err := q.db.Exec(ctx, setReservationStatus, arg.NewStatus, arg.ID, arg.CurrentStatus)
 	if err != nil {
 		return 0, err
 	}
