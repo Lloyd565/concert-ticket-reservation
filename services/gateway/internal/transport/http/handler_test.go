@@ -45,7 +45,11 @@ const (
 type stubBooking struct {
 	bookingv1.BookingServiceClient
 	lastHold *bookingv1.HoldSeatsRequest
-	err      error
+	lastPay  *bookingv1.PayReservationRequest
+	// payStatus is what the saga would have reported: confirmed, failed or
+	// pending. The gateway's job is to turn each into the right status code.
+	payStatus string
+	err       error
 }
 
 func (s *stubBooking) HoldSeats(_ context.Context, in *bookingv1.HoldSeatsRequest, _ ...grpc.CallOption) (*bookingv1.HoldSeatsResponse, error) {
@@ -56,6 +60,23 @@ func (s *stubBooking) HoldSeats(_ context.Context, in *bookingv1.HoldSeatsReques
 	return &bookingv1.HoldSeatsResponse{
 		ReservationId: "0192f3c4-0000-7000-8000-000000000001",
 		ExpiresAt:     timestamppb.New(time.Now().Add(10 * time.Minute)),
+	}, nil
+}
+
+func (s *stubBooking) PayReservation(_ context.Context, in *bookingv1.PayReservationRequest, _ ...grpc.CallOption) (*bookingv1.PayReservationResponse, error) {
+	s.lastPay = in
+	if s.err != nil {
+		return nil, s.err
+	}
+	status := s.payStatus
+	if status == "" {
+		status = "confirmed"
+	}
+	return &bookingv1.PayReservationResponse{
+		ReservationId: in.GetReservationId(),
+		Status:        status,
+		BookingId:     "0192f3c4-0000-7000-8000-000000000003",
+		DeclineReason: "card declined by issuer",
 	}, nil
 }
 
@@ -441,4 +462,100 @@ func errorCode(t *testing.T, body []byte) string {
 		t.Fatalf("decode error body %q: %v", body, err)
 	}
 	return payload.Error
+}
+
+// payRequest builds an authenticated payment request for a reservation.
+func payRequest(t *testing.T, token string) *http.Request {
+	t.Helper()
+	req := httptest.NewRequest(http.MethodPost, "/v1/reservations/0192f3c4-0000-7000-8000-000000000001/pay", strings.NewReader(`{}`))
+	req.Header.Set("Authorization", "Bearer "+token)
+	req.Header.Set("Idempotency-Key", "pay-1")
+	return req
+}
+
+// TestPaymentOutcomesMapToStatusCodes is the edge's half of D8.
+//
+// Booking reports what happened; the gateway turns it into a status code. The
+// pending row is the one that matters: an unknown payment outcome must not
+// reach the customer as a failure, because the money may have moved and a retry
+// would look to them like paying twice.
+func TestPaymentOutcomesMapToStatusCodes(t *testing.T) {
+	cases := []struct {
+		name       string
+		payStatus  string
+		wantStatus int
+	}{
+		{"confirmed", "confirmed", http.StatusOK},
+		{"declined", "failed", http.StatusPaymentRequired},
+		{"outcome unknown", "pending", http.StatusAccepted},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			booking := &stubBooking{payStatus: tc.payStatus}
+			rec := httptest.NewRecorder()
+			newGateway(t, &stubAuth{}, booking, 1000, 1000).ServeHTTP(rec, payRequest(t, validToken(t)))
+
+			if rec.Code != tc.wantStatus {
+				t.Fatalf("status = %d body = %s, want %d", rec.Code, rec.Body.String(), tc.wantStatus)
+			}
+			if booking.lastPay == nil {
+				t.Fatal("Booking was never called")
+			}
+			// The identity Booking checks ownership against comes from the
+			// token, not the body: a reservation ID is not a capability.
+			if got := booking.lastPay.GetUserId(); got != testUserID {
+				t.Errorf("forwarded user_id = %q, want %q", got, testUserID)
+			}
+			if got := booking.lastPay.GetReservationId(); got != "0192f3c4-0000-7000-8000-000000000001" {
+				t.Errorf("forwarded reservation_id = %q", got)
+			}
+		})
+	}
+}
+
+// TestPayRequiresIdempotencyKey - the rule holds at the edge for every mutating
+// route, not just holds (AGENTS.md §2 rule 10).
+func TestPayRequiresIdempotencyKey(t *testing.T) {
+	booking := &stubBooking{}
+	req := payRequest(t, validToken(t))
+	req.Header.Del("Idempotency-Key")
+
+	rec := httptest.NewRecorder()
+	newGateway(t, &stubAuth{}, booking, 1000, 1000).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusBadRequest {
+		t.Fatalf("status = %d, want 400", rec.Code)
+	}
+	if booking.lastPay != nil {
+		t.Error("a keyless payment reached Booking")
+	}
+}
+
+// TestPayRequiresAToken: paying is not anonymous.
+func TestPayRequiresAToken(t *testing.T) {
+	booking := &stubBooking{}
+	req := payRequest(t, validToken(t))
+	req.Header.Del("Authorization")
+
+	rec := httptest.NewRecorder()
+	newGateway(t, &stubAuth{}, booking, 1000, 1000).ServeHTTP(rec, req)
+
+	if rec.Code != http.StatusUnauthorized {
+		t.Fatalf("status = %d, want 401", rec.Code)
+	}
+	if booking.lastPay != nil {
+		t.Error("an unauthenticated payment reached Booking")
+	}
+}
+
+// TestUnpayableReservationIsAConflict: Booking's FailedPrecondition is the
+// caller asking for something the reservation is past - a 409, not a 500.
+func TestUnpayableReservationIsAConflict(t *testing.T) {
+	booking := &stubBooking{err: status.Error(codes.FailedPrecondition, "this reservation can no longer be paid for")}
+	rec := httptest.NewRecorder()
+	newGateway(t, &stubAuth{}, booking, 1000, 1000).ServeHTTP(rec, payRequest(t, validToken(t)))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d body = %s, want 409", rec.Code, rec.Body.String())
+	}
 }
