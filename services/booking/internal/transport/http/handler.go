@@ -21,12 +21,13 @@ import (
 type Handler struct {
 	holder *usecase.Holder
 	seeder *usecase.Seeder
+	saga   *usecase.Saga
 	log    *slog.Logger
 }
 
 // NewHandler wires a Handler.
-func NewHandler(holder *usecase.Holder, seeder *usecase.Seeder, log *slog.Logger) *Handler {
-	return &Handler{holder: holder, seeder: seeder, log: log}
+func NewHandler(holder *usecase.Holder, seeder *usecase.Seeder, saga *usecase.Saga, log *slog.Logger) *Handler {
+	return &Handler{holder: holder, seeder: seeder, saga: saga, log: log}
 }
 
 // Routes returns the service's mux, including liveness and readiness (NFR-4.4).
@@ -44,6 +45,7 @@ func (h *Handler) Routes(ready func() error) *http.ServeMux {
 	})
 	mux.HandleFunc("POST /events/seed", h.seedEvent)
 	mux.HandleFunc("POST /reservations", h.holdSeats)
+	mux.HandleFunc("POST /reservations/{id}/pay", h.payReservation)
 	return mux
 }
 
@@ -114,16 +116,67 @@ func (h *Handler) holdSeats(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	reservationID, expiresAt, err := h.holder.HoldSeats(r.Context(), req.EventID, req.SeatIDs, req.UserID, key)
+	held, err := h.holder.HoldSeats(r.Context(), req.EventID, req.SeatIDs, req.UserID, key)
 	if err != nil {
 		h.fail(w, r, err)
 		return
 	}
 	// The expiry is explicit in the response so the client can show the
-	// checkout countdown without guessing (FR-3.3).
+	// checkout countdown without guessing (FR-3.3), and the total so it knows
+	// what it is about to be charged.
 	writeJSON(w, http.StatusCreated, map[string]any{
-		"reservation_id": reservationID,
-		"expires_at":     expiresAt.UTC().Format(time.RFC3339),
+		"reservation_id": held.ReservationID,
+		"expires_at":     held.ExpiresAt.UTC().Format(time.RFC3339),
+		"total_cents":    held.TotalCents,
+	})
+}
+
+type payRequest struct {
+	UserID string `json:"user_id"`
+}
+
+// payReservation drives the saga (PRD §4.1 step 5). Requires an
+// Idempotency-Key header like every other mutating endpoint (AGENTS.md §2 rule
+// 10); the charge itself is made idempotent by the reservation ID, which is a
+// stronger scope than any key the client can choose - see
+// usecase.ChargeIdempotencyKey.
+func (h *Handler) payReservation(w http.ResponseWriter, r *http.Request) {
+	if r.Header.Get("Idempotency-Key") == "" {
+		writeError(w, http.StatusBadRequest, "idempotency_key_required", "the Idempotency-Key header is required")
+		return
+	}
+	var req payRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_body", "request body is not valid JSON")
+		return
+	}
+
+	conf, err := h.saga.Pay(r.Context(), r.PathValue("id"), req.UserID, r.Header.Get("Idempotency-Key"))
+	if errors.Is(err, domain.ErrPaymentDeclined) {
+		// A settled answer, not a server fault. The seats are already back on
+		// sale by the time this is written.
+		writeJSON(w, http.StatusPaymentRequired, map[string]any{
+			"reservation_id": conf.ReservationID,
+			"status":         string(conf.Status),
+			"error":          "payment_declined",
+			"message":        conf.DeclineReason,
+		})
+		return
+	}
+	if err != nil {
+		h.fail(w, r, err)
+		return
+	}
+
+	tickets := make([]map[string]string, 0, len(conf.Tickets))
+	for _, t := range conf.Tickets {
+		tickets = append(tickets, map[string]string{"id": t.ID, "seat_id": t.SeatID, "qr_code": t.QRCode})
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"reservation_id": conf.ReservationID,
+		"status":         string(conf.Status),
+		"booking_id":     conf.Booking.ID,
+		"tickets":        tickets,
 	})
 }
 
@@ -144,6 +197,23 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		writeError(w, http.StatusNotFound, "seat_not_found", "one or more seats do not exist for this event")
 	case errors.Is(err, domain.ErrDuplicateRequest):
 		writeError(w, http.StatusConflict, "duplicate_request", "an identical request is already in flight")
+	case errors.Is(err, domain.ErrPaymentOutcomeUnknown):
+		// 202, not 5xx. The request was accepted, the seats are still held, and
+		// reconciliation will settle it either way - reporting a failure here
+		// would tell the customer their payment did not happen when it may
+		// well have (D8).
+		writeJSON(w, http.StatusAccepted, map[string]string{
+			"status":  "pending",
+			"message": "the payment outcome is not yet known; this reservation is being reconciled",
+		})
+	case errors.Is(err, domain.ErrNotReservationOwner):
+		writeError(w, http.StatusForbidden, "forbidden", "this reservation belongs to another user")
+	case errors.Is(err, domain.ErrReservationNotPayable):
+		writeError(w, http.StatusConflict, "reservation_not_payable", "this reservation can no longer be paid for")
+	case errors.Is(err, domain.ErrReservationNotFound):
+		writeError(w, http.StatusNotFound, "reservation_not_found", "reservation not found")
+	case errors.Is(err, domain.ErrConfirmUnrecoverable):
+		writeError(w, http.StatusConflict, "confirm_failed", "the reservation could not be confirmed")
 	case errors.Is(err, domain.ErrInvalidInput), errors.Is(err, domain.ErrNoSeatsRequested), errors.Is(err, domain.ErrInvalidTransition):
 		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
 	default:

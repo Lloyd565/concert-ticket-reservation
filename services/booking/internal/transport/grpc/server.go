@@ -26,12 +26,13 @@ type Server struct {
 	bookingv1.UnimplementedBookingServiceServer
 	holder *usecase.Holder
 	seeder *usecase.Seeder
+	saga   *usecase.Saga
 	log    *slog.Logger
 }
 
 // NewServer wires a Server.
-func NewServer(holder *usecase.Holder, seeder *usecase.Seeder, log *slog.Logger) *Server {
-	return &Server{holder: holder, seeder: seeder, log: log}
+func NewServer(holder *usecase.Holder, seeder *usecase.Seeder, saga *usecase.Saga, log *slog.Logger) *Server {
+	return &Server{holder: holder, seeder: seeder, saga: saga, log: log}
 }
 
 // SeedEvent creates a demo event and its seat map (NFR-6.2).
@@ -76,13 +77,68 @@ func (s *Server) HoldSeats(ctx context.Context, req *bookingv1.HoldSeatsRequest)
 		// without a key has no safe retry.
 		return nil, status.Error(codes.InvalidArgument, "idempotency key is required")
 	}
-	reservationID, expiresAt, err := s.holder.HoldSeats(ctx, req.GetEventId(), req.GetSeatIds(), req.GetUserId(), req.GetIdempotencyKey())
+	held, err := s.holder.HoldSeats(ctx, req.GetEventId(), req.GetSeatIds(), req.GetUserId(), req.GetIdempotencyKey())
 	if err != nil {
 		return nil, s.fail(ctx, "hold_seats", err)
 	}
 	return &bookingv1.HoldSeatsResponse{
-		ReservationId: reservationID,
-		ExpiresAt:     timestamppb.New(expiresAt.UTC()),
+		ReservationId: held.ReservationID,
+		ExpiresAt:     timestamppb.New(held.ExpiresAt.UTC()),
+		TotalCents:    held.TotalCents,
+	}, nil
+}
+
+// PayReservation drives the saga to a conclusion (PRD §4.1 step 5).
+//
+// Three of its outcomes are reported as a successful RPC carrying a status,
+// not as errors: confirmed, failed (declined), and pending (the payment outcome
+// is unknown). All three are things that definitely happened to the
+// reservation, and the caller needs to be told which - so the answer belongs in
+// the response, where a status field can say it precisely.
+//
+// The pending case is why this matters. Reported as an error code, it would
+// reach the customer as "your payment failed" when the money may well have
+// moved, and would invite a retry that looks to them like a second purchase.
+// Reported as a status, the edge can answer 202: accepted, still settling
+// (D8).
+//
+// Errors are reserved for requests that could not be processed at all: an
+// unknown reservation, somebody else's reservation, one that is past paying
+// for.
+func (s *Server) PayReservation(ctx context.Context, req *bookingv1.PayReservationRequest) (*bookingv1.PayReservationResponse, error) {
+	if req.GetIdempotencyKey() == "" {
+		return nil, status.Error(codes.InvalidArgument, "idempotency key is required")
+	}
+	conf, err := s.saga.Pay(ctx, req.GetReservationId(), req.GetUserId(), req.GetIdempotencyKey())
+	switch {
+	case errors.Is(err, domain.ErrPaymentDeclined):
+		// Settled: the seats are already back on sale and the reservation is
+		// failed by the time this is written.
+		return &bookingv1.PayReservationResponse{
+			ReservationId: conf.ReservationID,
+			Status:        string(domain.ReservationFailed),
+			DeclineReason: conf.DeclineReason,
+		}, nil
+	case errors.Is(err, domain.ErrPaymentOutcomeUnknown):
+		// Unsettled, and deliberately so. The seats are still held and
+		// reconciliation owns the reservation from here.
+		return &bookingv1.PayReservationResponse{
+			ReservationId: req.GetReservationId(),
+			Status:        string(domain.ReservationPending),
+		}, nil
+	case err != nil:
+		return nil, s.fail(ctx, "pay_reservation", err)
+	}
+
+	tickets := make([]*bookingv1.Ticket, 0, len(conf.Tickets))
+	for _, t := range conf.Tickets {
+		tickets = append(tickets, &bookingv1.Ticket{Id: t.ID, SeatId: t.SeatID, QrCode: t.QRCode})
+	}
+	return &bookingv1.PayReservationResponse{
+		ReservationId: conf.ReservationID,
+		Status:        string(conf.Status),
+		BookingId:     conf.Booking.ID,
+		Tickets:       tickets,
 	}, nil
 }
 
@@ -105,6 +161,14 @@ func (s *Server) fail(ctx context.Context, op string, err error) error {
 		return status.Error(codes.NotFound, "one or more seats do not exist for this event")
 	case errors.Is(err, domain.ErrDuplicateRequest):
 		return status.Error(codes.Aborted, "an identical request is already in flight")
+	case errors.Is(err, domain.ErrNotReservationOwner):
+		return status.Error(codes.PermissionDenied, "this reservation belongs to another user")
+	case errors.Is(err, domain.ErrReservationNotPayable):
+		return status.Error(codes.FailedPrecondition, "this reservation can no longer be paid for")
+	case errors.Is(err, domain.ErrReservationNotFound):
+		return status.Error(codes.NotFound, "reservation not found")
+	case errors.Is(err, domain.ErrConfirmUnrecoverable):
+		return status.Error(codes.Aborted, "the reservation could not be confirmed")
 	case errors.Is(err, domain.ErrInvalidInput), errors.Is(err, domain.ErrNoSeatsRequested), errors.Is(err, domain.ErrInvalidTransition):
 		return status.Error(codes.InvalidArgument, err.Error())
 	default:
