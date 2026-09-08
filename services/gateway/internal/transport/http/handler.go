@@ -79,6 +79,7 @@ func (h *Handler) Routes() http.Handler {
 	// open to any signed-in role.
 	mux.Handle("POST /v1/events", h.authn.Require(roleOrganizer, roleAdmin)(http.HandlerFunc(h.seedEvent)))
 	mux.Handle("POST /v1/reservations", h.authn.Require()(http.HandlerFunc(h.holdSeats)))
+	mux.Handle("POST /v1/reservations/{id}/pay", h.authn.Require()(http.HandlerFunc(h.payReservation)))
 
 	return middleware.Correlate(h.limiter.Middleware(mux))
 }
@@ -264,7 +265,66 @@ func (h *Handler) holdSeats(w http.ResponseWriter, r *http.Request) {
 	middleware.WriteJSON(w, http.StatusCreated, map[string]any{
 		"reservation_id": res.GetReservationId(),
 		"expires_at":     res.GetExpiresAt().AsTime().UTC().Format(time.RFC3339),
+		"total_cents":    res.GetTotalCents(),
 	})
+}
+
+// payReservation forwards a payment to Booking, which orchestrates the saga
+// (ARCHITECTURE.md §6, D7).
+//
+// Booking answers with what happened rather than with an error, and this
+// translates those three outcomes into the three status codes that mean them.
+// The 202 is the one that matters: it says the request was accepted and the
+// outcome is not settled yet. Reporting that as a 5xx would tell the customer
+// their payment failed when the money may have moved, and invite a retry that
+// looks to them like paying twice (D8).
+func (h *Handler) payReservation(w http.ResponseWriter, r *http.Request) {
+	key := r.Header.Get("Idempotency-Key")
+	if key == "" {
+		middleware.WriteError(w, http.StatusBadRequest, "idempotency_key_required", "the Idempotency-Key header is required")
+		return
+	}
+	// The subject comes from the validated token, never from the body: a
+	// reservation ID is not a capability, and Booking checks ownership against
+	// whatever this says.
+	claims, ok := middleware.ClaimsFrom(r.Context())
+	if !ok {
+		middleware.WriteError(w, http.StatusUnauthorized, "unauthenticated", "a bearer access token is required")
+		return
+	}
+	res, err := h.booking.PayReservation(r.Context(), &bookingv1.PayReservationRequest{
+		ReservationId:  r.PathValue("id"),
+		UserId:         claims.UserID,
+		IdempotencyKey: key,
+	})
+	if err != nil {
+		h.fail(w, r, "booking", err)
+		return
+	}
+
+	body := map[string]any{
+		"reservation_id": res.GetReservationId(),
+		"status":         res.GetStatus(),
+	}
+	switch res.GetStatus() {
+	case "pending":
+		// Accepted, not settled. The seats are still held and the
+		// reconciliation job owns the reservation from here.
+		body["message"] = "the payment outcome is not yet known; this reservation is being reconciled"
+		middleware.WriteJSON(w, http.StatusAccepted, body)
+	case "failed":
+		body["error"] = "payment_declined"
+		body["message"] = res.GetDeclineReason()
+		middleware.WriteJSON(w, http.StatusPaymentRequired, body)
+	default:
+		tickets := make([]map[string]string, 0, len(res.GetTickets()))
+		for _, t := range res.GetTickets() {
+			tickets = append(tickets, map[string]string{"id": t.GetId(), "seat_id": t.GetSeatId(), "qr_code": t.GetQrCode()})
+		}
+		body["booking_id"] = res.GetBookingId()
+		body["tickets"] = tickets
+		middleware.WriteJSON(w, http.StatusOK, body)
+	}
 }
 
 // fail maps a gRPC status from an upstream service back to an HTTP status.
@@ -286,6 +346,11 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, upstream string, 
 		middleware.WriteError(w, http.StatusConflict, "already_exists", st.Message())
 	case codes.Aborted:
 		// A lost race for a seat. Expected under contention, not a fault.
+		middleware.WriteError(w, http.StatusConflict, "conflict", st.Message())
+	case codes.FailedPrecondition:
+		// The reservation is in a state the request does not apply to - past
+		// its checkout window, or already settled. The caller's mistake, not
+		// the server's.
 		middleware.WriteError(w, http.StatusConflict, "conflict", st.Message())
 	case codes.Unavailable:
 		h.log.WarnContext(r.Context(), "upstream unavailable", "upstream", upstream, "error", err)
