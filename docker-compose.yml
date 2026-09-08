@@ -1,6 +1,14 @@
-# Local stack. P0 scope: Postgres + Booking only.
-# Auth, Gateway, Payment, Notification, Redis, RabbitMQ, Jaeger, Prometheus,
-# Grafana and the seed job are added in their own phases (P1-P5).
+# Local stack. P1 scope: Postgres (booking_db), auth_db, Booking, Auth, Gateway.
+# Payment, Notification, Redis, RabbitMQ, Jaeger, Prometheus, Grafana and the
+# seed job are added in their own phases (P2-P5).
+#
+# There are no start-order dependencies between the three services. Each waits
+# only on its own database, and the gateway waits on nothing: it dials Auth and
+# Booking lazily, so it serves whether they are up yet or not
+# (ARCHITECTURE.md §3.3).
+#
+# Build contexts are the repository root because every service depends on the
+# shared proto module through a replace directive.
 services:
   postgres:
     image: postgres:16-alpine
@@ -19,13 +27,39 @@ services:
       retries: 10
       start_period: 10s
 
+  # A separate container, not a second database in the one above: database per
+  # service (D2), and Auth's data has a different security posture to Booking's.
+  auth_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${AUTH_DB_NAME:-auth_db}
+    ports:
+      - "${AUTH_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - authdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
   booking:
-    build: ./services/booking
+    build:
+      context: .
+      dockerfile: services/booking/Dockerfile
     environment:
       BOOKING_HTTP_PORT: "8080"
-      BOOKING_DATABASE_URL: ${BOOKING_DATABASE_URL:-postgres://postgres:postgres@postgres:5432/booking_db?sslmode=disable}
+      BOOKING_GRPC_PORT: "9092"
+      # Container-side DSN: the host is the compose service name, not localhost.
+      BOOKING_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${BOOKING_DB_NAME:-booking_db}?sslmode=disable
+      BOOKING_HOLD_TTL: ${BOOKING_HOLD_TTL:-10m}
+      BOOKING_SWEEP_INTERVAL: ${BOOKING_SWEEP_INTERVAL:-5s}
     ports:
       - "${BOOKING_HTTP_PORT:-8080}:8080"
+      - "${BOOKING_GRPC_PORT:-9092}:9092"
     depends_on:
       postgres:
         condition: service_healthy
@@ -36,5 +70,67 @@ services:
       retries: 5
       start_period: 5s
 
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    environment:
+      AUTH_HTTP_PORT: "8081"
+      AUTH_GRPC_PORT: "9091"
+      AUTH_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@auth_db:5432/${AUTH_DB_NAME:-auth_db}?sslmode=disable
+      # Shared with the gateway, which verifies signatures with it. The service
+      # refuses to start if it is short or unset - see internal/config.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - see .env.example}
+      JWT_ISSUER: ${JWT_ISSUER:-concert-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-concert-api}
+      AUTH_ACCESS_TTL: ${AUTH_ACCESS_TTL:-15m}
+      AUTH_REFRESH_TTL: ${AUTH_REFRESH_TTL:-168h}
+      # Creates the first admin if none exists, so a fresh stack is demoable
+      # with no manual psql step. A no-op on every later start. Unset both to
+      # disable.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+    ports:
+      - "${AUTH_HTTP_PORT:-8081}:8081"
+      - "${AUTH_GRPC_PORT:-9091}:9091"
+    depends_on:
+      auth_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      GATEWAY_HTTP_PORT: "8000"
+      GATEWAY_AUTH_ADDR: auth:9091
+      GATEWAY_BOOKING_ADDR: booking:9092
+      # The same secret Auth signs with. Verification is local: the gateway
+      # never calls Auth to check an access token (ARCHITECTURE.md §3.3).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - see .env.example}
+      JWT_ISSUER: ${JWT_ISSUER:-concert-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-concert-api}
+      GATEWAY_RATE_LIMIT_RPS: ${GATEWAY_RATE_LIMIT_RPS:-20}
+      GATEWAY_RATE_LIMIT_BURST: ${GATEWAY_RATE_LIMIT_BURST:-40}
+      GATEWAY_UPSTREAM_TIMEOUT: ${GATEWAY_UPSTREAM_TIMEOUT:-5s}
+    ports:
+      - "${GATEWAY_HTTP_PORT:-8000}:8000"
+    # Deliberately no depends_on. The gateway must come up with its upstreams
+    # down; making it wait would contradict the failure-domain design it exists
+    # to demonstrate.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
 volumes:
   pgdata:
+  authdata:
