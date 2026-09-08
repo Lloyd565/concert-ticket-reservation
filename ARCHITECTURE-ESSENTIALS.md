@@ -43,6 +43,7 @@ One readable place holding the flow beats distributed event chains for both corr
 
 **D8 — Never blind-release seats on a payment timeout.**
 Unknown outcome ≠ failure. The charge may have succeeded. Leave the reservation `pending` and let the reconciliation job resolve it by idempotency key.
+There are **two** ways to break this, and the second is the one that gets missed: the saga must not release, *and neither must the sweeper*. A reservation with an unknown payment outcome is marked (`reservations.payment_pending_since`) and every expiry path skips it. Reconciliation is then its only owner, so that job must run well inside the hold TTL.
 
 **D9 — Transactional outbox for all event publication.**
 Write state change + outbox row in one DB transaction; a relay publishes. Prevents lost events on crash.
@@ -118,7 +119,7 @@ Dependencies point inward, always.
 |---|---|---|
 | **P0** | Booking monolith, Postgres `FOR UPDATE`, `held_until` column | **Concurrency test passes** |
 | **P1** | Auth service + Gateway | Independent services, routing works |
-| **P2** | Payment service + Saga | Payment failure demonstrably releases seats |
+| **P2** | Payment service + Saga | Payment failure demonstrably releases seats; payment *timeout* demonstrably does not (`make test-saga`) |
 | **P3** | Redis TTL holds, multi-replica Booking | Holds expire without sweeper; concurrency test green with 2+ replicas |
 | **P4** | Event bus + Notification | Killing Notification doesn't break booking |
 | **P5** | Tracing, metrics, circuit breakers, DLQ | Request traceable end-to-end |
