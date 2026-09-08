@@ -19,7 +19,16 @@ type SeedSpec struct {
 	Sections    []string
 	Rows        int
 	SeatsPerRow int
+	// PriceCents is what every seat in this map costs. Flat, because P2 has no
+	// pricing tiers - see the note on seats.price_cents in migration 000002.
+	// Zero falls back to DefaultSeatPriceCents so a seeded event is payable.
+	PriceCents int64
 }
+
+// DefaultSeatPriceCents is what a seeded seat costs when the caller does not
+// say. It exists so the demo stack has something to charge for; a real seat map
+// gets its price from the organizer flow.
+const DefaultSeatPriceCents int64 = 5000
 
 // Seeder creates demo events and their seat maps (NFR-6.2).
 type Seeder struct {
@@ -44,6 +53,12 @@ func (s *Seeder) Seed(ctx context.Context, spec SeedSpec) (domain.Event, []domai
 	if spec.StartsAt.IsZero() {
 		spec.StartsAt = time.Now().UTC().Add(30 * 24 * time.Hour)
 	}
+	if spec.PriceCents < 0 {
+		return domain.Event{}, nil, fmt.Errorf("seed: price must not be negative, got %d: %w", spec.PriceCents, domain.ErrInvalidInput)
+	}
+	if spec.PriceCents == 0 {
+		spec.PriceCents = DefaultSeatPriceCents
+	}
 
 	ev := domain.Event{
 		ID:       uuid.Must(uuid.NewV7()).String(),
@@ -55,12 +70,13 @@ func (s *Seeder) Seed(ctx context.Context, spec SeedSpec) (domain.Event, []domai
 		for row := 1; row <= spec.Rows; row++ {
 			for num := 1; num <= spec.SeatsPerRow; num++ {
 				seats = append(seats, domain.Seat{
-					ID:      uuid.Must(uuid.NewV7()).String(),
-					EventID: ev.ID,
-					Section: section,
-					Row:     strconv.Itoa(row),
-					Number:  strconv.Itoa(num),
-					Status:  domain.SeatAvailable,
+					ID:         uuid.Must(uuid.NewV7()).String(),
+					EventID:    ev.ID,
+					Section:    section,
+					Row:        strconv.Itoa(row),
+					Number:     strconv.Itoa(num),
+					Status:     domain.SeatAvailable,
+					PriceCents: spec.PriceCents,
 				})
 			}
 		}

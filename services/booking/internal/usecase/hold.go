@@ -15,6 +15,17 @@ import (
 // DefaultHoldTTL is the checkout window (PRD §4.1 step 4).
 const DefaultHoldTTL = 10 * time.Minute
 
+// Hold is a successful claim on a set of seats.
+type Hold struct {
+	ReservationID string
+	// ExpiresAt is when the checkout window closes. Returned explicitly so the
+	// client can show a countdown rather than guess (FR-3.3).
+	ExpiresAt time.Time
+	// TotalCents is what the reservation is worth, fixed at claim time. It is
+	// the amount the saga charges.
+	TotalCents int64
+}
+
 // Holder claims seats on behalf of a user. It owns the single most contended
 // operation in the system.
 type Holder struct {
@@ -34,9 +45,9 @@ func NewHolder(tx TxManager, seats SeatRepository, reservations ReservationRepos
 
 // HoldSeats atomically claims every requested seat for userID, or claims none.
 //
-// It returns the new reservation's ID and the instant its checkout window
-// closes. Losers of a race for a seat get domain.ErrSeatUnavailable, which the
-// transport layer maps to 409 rather than 500 (FR-3.2).
+// It returns the new reservation, its checkout deadline and its price. Losers
+// of a race for a seat get domain.ErrSeatUnavailable, which the transport layer
+// maps to 409 rather than 500 (FR-3.2).
 //
 // idempotencyKey is required (AGENTS.md §2 rule 10, FR-3.7): replaying a
 // request with a key that has already been used returns the original
@@ -45,26 +56,23 @@ func NewHolder(tx TxManager, seats SeatRepository, reservations ReservationRepos
 // Nothing external is called from inside the transaction. The claim commits and
 // the locks drop before this function returns, so the Payment call added in P2
 // happens strictly afterwards (D4).
-func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string, userID, idempotencyKey string) (string, time.Time, error) {
+func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string, userID, idempotencyKey string) (Hold, error) {
 	if idempotencyKey == "" {
-		return "", time.Time{}, fmt.Errorf("hold seats: idempotency key required: %w", domain.ErrInvalidInput)
+		return Hold{}, fmt.Errorf("hold seats: idempotency key required: %w", domain.ErrInvalidInput)
 	}
 	requested, err := canonicalSeatIDs(seatIDs)
 	if err != nil {
-		return "", time.Time{}, fmt.Errorf("hold seats: %w", err)
+		return Hold{}, fmt.Errorf("hold seats: %w", err)
 	}
 
-	var (
-		reservationID string
-		expiresAt     time.Time
-	)
+	var held Hold
 
 	err = h.tx.WithinTx(ctx, func(ctx context.Context) error {
 		// Idempotency first: a replay must not take locks it does not need,
 		// and must not create a second reservation.
 		switch existing, err := h.reservations.FindReservationByIdempotencyKey(ctx, idempotencyKey); {
 		case err == nil:
-			reservationID, expiresAt = existing.ID, existing.ExpiresAt
+			held = Hold{ReservationID: existing.ID, ExpiresAt: existing.ExpiresAt, TotalCents: existing.TotalCents}
 			return nil
 		case !errors.Is(err, domain.ErrReservationNotFound):
 			return err
@@ -93,10 +101,16 @@ func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string
 		}
 		// All-or-nothing (D6): every seat is inspected before anything is
 		// written, so a partial hold cannot be left behind by an early return.
+		var totalCents int64
 		for i := range locked {
 			if !locked[i].Available() {
 				return fmt.Errorf("seat %s is %s: %w", locked[i].ID, locked[i].Status, domain.ErrSeatUnavailable)
 			}
+			// The amount is fixed here, under the same lock that claims the
+			// seats, and stored on the reservation. Re-summing it at payment
+			// time would let a price change between the hold and the charge
+			// move the total out from under the customer.
+			totalCents += locked[i].PriceCents
 		}
 
 		// ---- The act ------------------------------------------------------
@@ -110,6 +124,7 @@ func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string
 			EventID:        eventID,
 			Status:         domain.ReservationPending,
 			SeatIDs:        requested,
+			TotalCents:     totalCents,
 			ExpiresAt:      now.Add(h.ttl),
 			IdempotencyKey: idempotencyKey,
 			CreatedAt:      now,
@@ -143,15 +158,15 @@ func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string
 			return fmt.Errorf("held %d of %d locked seats: %w", n, len(requested), domain.ErrSeatUnavailable)
 		}
 
-		reservationID, expiresAt = res.ID, res.ExpiresAt
+		held = Hold{ReservationID: res.ID, ExpiresAt: res.ExpiresAt, TotalCents: res.TotalCents}
 		return nil
 	})
 	if err != nil {
-		return "", time.Time{}, err
+		return Hold{}, err
 	}
-	// Committed. Locks are released and the caller is free to make external
-	// calls - which is where Payment enters in P2.
-	return reservationID, expiresAt, nil
+	// Committed. Locks are released, so the caller is free to make external
+	// calls - which is exactly what the saga does next (D4).
+	return held, nil
 }
 
 // canonicalSeatIDs validates, de-duplicates and sorts the requested seat IDs.
