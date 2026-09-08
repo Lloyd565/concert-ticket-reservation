@@ -4,8 +4,10 @@
 // 	protoc        (unknown)
 // source: booking/v1/booking.proto
 
-// Booking service contract. P1 exposes exactly the two operations the gateway
-// routes today; the seat-state authority's own logic is untouched by this file.
+// Booking service contract. P2 adds the saga entry point: holding seats and
+// paying for them are two operations, not one, because the attendee gets a
+// 10-minute checkout window between them (PRD §4.1 steps 4-5) and because the
+// hold transaction must commit before Payment is called (D4).
 
 package bookingv1
 
@@ -322,6 +324,9 @@ type HoldSeatsResponse struct {
 	state         protoimpl.MessageState `protogen:"open.v1"`
 	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
 	ExpiresAt     *timestamppb.Timestamp `protobuf:"bytes,2,opt,name=expires_at,json=expiresAt,proto3" json:"expires_at,omitempty"`
+	// What the caller owes. P2 prices a seat map at a flat per-seat rate; tiered
+	// pricing arrives with the organizer flow.
+	TotalCents    int64 `protobuf:"varint,3,opt,name=total_cents,json=totalCents,proto3" json:"total_cents,omitempty"`
 	unknownFields protoimpl.UnknownFields
 	sizeCache     protoimpl.SizeCache
 }
@@ -370,6 +375,220 @@ func (x *HoldSeatsResponse) GetExpiresAt() *timestamppb.Timestamp {
 	return nil
 }
 
+func (x *HoldSeatsResponse) GetTotalCents() int64 {
+	if x != nil {
+		return x.TotalCents
+	}
+	return 0
+}
+
+type Ticket struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	Id            string                 `protobuf:"bytes,1,opt,name=id,proto3" json:"id,omitempty"`
+	SeatId        string                 `protobuf:"bytes,2,opt,name=seat_id,json=seatId,proto3" json:"seat_id,omitempty"`
+	QrCode        string                 `protobuf:"bytes,3,opt,name=qr_code,json=qrCode,proto3" json:"qr_code,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *Ticket) Reset() {
+	*x = Ticket{}
+	mi := &file_booking_v1_booking_proto_msgTypes[5]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *Ticket) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*Ticket) ProtoMessage() {}
+
+func (x *Ticket) ProtoReflect() protoreflect.Message {
+	mi := &file_booking_v1_booking_proto_msgTypes[5]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use Ticket.ProtoReflect.Descriptor instead.
+func (*Ticket) Descriptor() ([]byte, []int) {
+	return file_booking_v1_booking_proto_rawDescGZIP(), []int{5}
+}
+
+func (x *Ticket) GetId() string {
+	if x != nil {
+		return x.Id
+	}
+	return ""
+}
+
+func (x *Ticket) GetSeatId() string {
+	if x != nil {
+		return x.SeatId
+	}
+	return ""
+}
+
+func (x *Ticket) GetQrCode() string {
+	if x != nil {
+		return x.QrCode
+	}
+	return ""
+}
+
+// PayReservationRequest drives the reservation saga to a conclusion.
+type PayReservationRequest struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	// The authenticated subject, set by the gateway from the validated token.
+	// Booking checks it against the reservation's owner: a reservation ID is not
+	// a capability.
+	UserId string `protobuf:"bytes,2,opt,name=user_id,json=userId,proto3" json:"user_id,omitempty"`
+	// Required (AGENTS.md §2 rule 10). Note that the *charge* is made idempotent
+	// by the reservation ID rather than by this key - see the saga use case for
+	// why the reservation is the stronger scope.
+	IdempotencyKey string `protobuf:"bytes,3,opt,name=idempotency_key,json=idempotencyKey,proto3" json:"idempotency_key,omitempty"`
+	unknownFields  protoimpl.UnknownFields
+	sizeCache      protoimpl.SizeCache
+}
+
+func (x *PayReservationRequest) Reset() {
+	*x = PayReservationRequest{}
+	mi := &file_booking_v1_booking_proto_msgTypes[6]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PayReservationRequest) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PayReservationRequest) ProtoMessage() {}
+
+func (x *PayReservationRequest) ProtoReflect() protoreflect.Message {
+	mi := &file_booking_v1_booking_proto_msgTypes[6]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PayReservationRequest.ProtoReflect.Descriptor instead.
+func (*PayReservationRequest) Descriptor() ([]byte, []int) {
+	return file_booking_v1_booking_proto_rawDescGZIP(), []int{6}
+}
+
+func (x *PayReservationRequest) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *PayReservationRequest) GetUserId() string {
+	if x != nil {
+		return x.UserId
+	}
+	return ""
+}
+
+func (x *PayReservationRequest) GetIdempotencyKey() string {
+	if x != nil {
+		return x.IdempotencyKey
+	}
+	return ""
+}
+
+type PayReservationResponse struct {
+	state         protoimpl.MessageState `protogen:"open.v1"`
+	ReservationId string                 `protobuf:"bytes,1,opt,name=reservation_id,json=reservationId,proto3" json:"reservation_id,omitempty"`
+	// Reservation status after the attempt: confirmed, failed, or pending when
+	// the payment outcome is unknown and reconciliation now owns the row (D8).
+	Status string `protobuf:"bytes,2,opt,name=status,proto3" json:"status,omitempty"`
+	// Set only when status is confirmed.
+	BookingId string    `protobuf:"bytes,3,opt,name=booking_id,json=bookingId,proto3" json:"booking_id,omitempty"`
+	Tickets   []*Ticket `protobuf:"bytes,4,rep,name=tickets,proto3" json:"tickets,omitempty"`
+	// Set only when status is failed.
+	DeclineReason string `protobuf:"bytes,5,opt,name=decline_reason,json=declineReason,proto3" json:"decline_reason,omitempty"`
+	unknownFields protoimpl.UnknownFields
+	sizeCache     protoimpl.SizeCache
+}
+
+func (x *PayReservationResponse) Reset() {
+	*x = PayReservationResponse{}
+	mi := &file_booking_v1_booking_proto_msgTypes[7]
+	ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+	ms.StoreMessageInfo(mi)
+}
+
+func (x *PayReservationResponse) String() string {
+	return protoimpl.X.MessageStringOf(x)
+}
+
+func (*PayReservationResponse) ProtoMessage() {}
+
+func (x *PayReservationResponse) ProtoReflect() protoreflect.Message {
+	mi := &file_booking_v1_booking_proto_msgTypes[7]
+	if x != nil {
+		ms := protoimpl.X.MessageStateOf(protoimpl.Pointer(x))
+		if ms.LoadMessageInfo() == nil {
+			ms.StoreMessageInfo(mi)
+		}
+		return ms
+	}
+	return mi.MessageOf(x)
+}
+
+// Deprecated: Use PayReservationResponse.ProtoReflect.Descriptor instead.
+func (*PayReservationResponse) Descriptor() ([]byte, []int) {
+	return file_booking_v1_booking_proto_rawDescGZIP(), []int{7}
+}
+
+func (x *PayReservationResponse) GetReservationId() string {
+	if x != nil {
+		return x.ReservationId
+	}
+	return ""
+}
+
+func (x *PayReservationResponse) GetStatus() string {
+	if x != nil {
+		return x.Status
+	}
+	return ""
+}
+
+func (x *PayReservationResponse) GetBookingId() string {
+	if x != nil {
+		return x.BookingId
+	}
+	return ""
+}
+
+func (x *PayReservationResponse) GetTickets() []*Ticket {
+	if x != nil {
+		return x.Tickets
+	}
+	return nil
+}
+
+func (x *PayReservationResponse) GetDeclineReason() string {
+	if x != nil {
+		return x.DeclineReason
+	}
+	return ""
+}
+
 var File_booking_v1_booking_proto protoreflect.FileDescriptor
 
 const file_booking_v1_booking_proto_rawDesc = "" +
@@ -397,14 +616,32 @@ const file_booking_v1_booking_proto_rawDesc = "" +
 	"\bevent_id\x18\x01 \x01(\tR\aeventId\x12\x19\n" +
 	"\bseat_ids\x18\x02 \x03(\tR\aseatIds\x12\x17\n" +
 	"\auser_id\x18\x03 \x01(\tR\x06userId\x12'\n" +
-	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"u\n" +
+	"\x0fidempotency_key\x18\x04 \x01(\tR\x0eidempotencyKey\"\x96\x01\n" +
 	"\x11HoldSeatsResponse\x12%\n" +
 	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x129\n" +
 	"\n" +
-	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt2\xa4\x01\n" +
+	"expires_at\x18\x02 \x01(\v2\x1a.google.protobuf.TimestampR\texpiresAt\x12\x1f\n" +
+	"\vtotal_cents\x18\x03 \x01(\x03R\n" +
+	"totalCents\"J\n" +
+	"\x06Ticket\x12\x0e\n" +
+	"\x02id\x18\x01 \x01(\tR\x02id\x12\x17\n" +
+	"\aseat_id\x18\x02 \x01(\tR\x06seatId\x12\x17\n" +
+	"\aqr_code\x18\x03 \x01(\tR\x06qrCode\"\x80\x01\n" +
+	"\x15PayReservationRequest\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x17\n" +
+	"\auser_id\x18\x02 \x01(\tR\x06userId\x12'\n" +
+	"\x0fidempotency_key\x18\x03 \x01(\tR\x0eidempotencyKey\"\xcb\x01\n" +
+	"\x16PayReservationResponse\x12%\n" +
+	"\x0ereservation_id\x18\x01 \x01(\tR\rreservationId\x12\x16\n" +
+	"\x06status\x18\x02 \x01(\tR\x06status\x12\x1d\n" +
+	"\n" +
+	"booking_id\x18\x03 \x01(\tR\tbookingId\x12,\n" +
+	"\atickets\x18\x04 \x03(\v2\x12.booking.v1.TicketR\atickets\x12%\n" +
+	"\x0edecline_reason\x18\x05 \x01(\tR\rdeclineReason2\xfd\x01\n" +
 	"\x0eBookingService\x12H\n" +
 	"\tSeedEvent\x12\x1c.booking.v1.SeedEventRequest\x1a\x1d.booking.v1.SeedEventResponse\x12H\n" +
-	"\tHoldSeats\x12\x1c.booking.v1.HoldSeatsRequest\x1a\x1d.booking.v1.HoldSeatsResponseBKZIgithub.com/lloyd565/concert-ticket-reservation/proto/booking/v1;bookingv1b\x06proto3"
+	"\tHoldSeats\x12\x1c.booking.v1.HoldSeatsRequest\x1a\x1d.booking.v1.HoldSeatsResponse\x12W\n" +
+	"\x0ePayReservation\x12!.booking.v1.PayReservationRequest\x1a\".booking.v1.PayReservationResponseBKZIgithub.com/lloyd565/concert-ticket-reservation/proto/booking/v1;bookingv1b\x06proto3"
 
 var (
 	file_booking_v1_booking_proto_rawDescOnce sync.Once
@@ -418,29 +655,35 @@ func file_booking_v1_booking_proto_rawDescGZIP() []byte {
 	return file_booking_v1_booking_proto_rawDescData
 }
 
-var file_booking_v1_booking_proto_msgTypes = make([]protoimpl.MessageInfo, 5)
+var file_booking_v1_booking_proto_msgTypes = make([]protoimpl.MessageInfo, 8)
 var file_booking_v1_booking_proto_goTypes = []any{
-	(*Seat)(nil),                  // 0: booking.v1.Seat
-	(*SeedEventRequest)(nil),      // 1: booking.v1.SeedEventRequest
-	(*SeedEventResponse)(nil),     // 2: booking.v1.SeedEventResponse
-	(*HoldSeatsRequest)(nil),      // 3: booking.v1.HoldSeatsRequest
-	(*HoldSeatsResponse)(nil),     // 4: booking.v1.HoldSeatsResponse
-	(*timestamppb.Timestamp)(nil), // 5: google.protobuf.Timestamp
+	(*Seat)(nil),                   // 0: booking.v1.Seat
+	(*SeedEventRequest)(nil),       // 1: booking.v1.SeedEventRequest
+	(*SeedEventResponse)(nil),      // 2: booking.v1.SeedEventResponse
+	(*HoldSeatsRequest)(nil),       // 3: booking.v1.HoldSeatsRequest
+	(*HoldSeatsResponse)(nil),      // 4: booking.v1.HoldSeatsResponse
+	(*Ticket)(nil),                 // 5: booking.v1.Ticket
+	(*PayReservationRequest)(nil),  // 6: booking.v1.PayReservationRequest
+	(*PayReservationResponse)(nil), // 7: booking.v1.PayReservationResponse
+	(*timestamppb.Timestamp)(nil),  // 8: google.protobuf.Timestamp
 }
 var file_booking_v1_booking_proto_depIdxs = []int32{
-	5, // 0: booking.v1.SeedEventRequest.starts_at:type_name -> google.protobuf.Timestamp
-	5, // 1: booking.v1.SeedEventResponse.starts_at:type_name -> google.protobuf.Timestamp
+	8, // 0: booking.v1.SeedEventRequest.starts_at:type_name -> google.protobuf.Timestamp
+	8, // 1: booking.v1.SeedEventResponse.starts_at:type_name -> google.protobuf.Timestamp
 	0, // 2: booking.v1.SeedEventResponse.seats:type_name -> booking.v1.Seat
-	5, // 3: booking.v1.HoldSeatsResponse.expires_at:type_name -> google.protobuf.Timestamp
-	1, // 4: booking.v1.BookingService.SeedEvent:input_type -> booking.v1.SeedEventRequest
-	3, // 5: booking.v1.BookingService.HoldSeats:input_type -> booking.v1.HoldSeatsRequest
-	2, // 6: booking.v1.BookingService.SeedEvent:output_type -> booking.v1.SeedEventResponse
-	4, // 7: booking.v1.BookingService.HoldSeats:output_type -> booking.v1.HoldSeatsResponse
-	6, // [6:8] is the sub-list for method output_type
-	4, // [4:6] is the sub-list for method input_type
-	4, // [4:4] is the sub-list for extension type_name
-	4, // [4:4] is the sub-list for extension extendee
-	0, // [0:4] is the sub-list for field type_name
+	8, // 3: booking.v1.HoldSeatsResponse.expires_at:type_name -> google.protobuf.Timestamp
+	5, // 4: booking.v1.PayReservationResponse.tickets:type_name -> booking.v1.Ticket
+	1, // 5: booking.v1.BookingService.SeedEvent:input_type -> booking.v1.SeedEventRequest
+	3, // 6: booking.v1.BookingService.HoldSeats:input_type -> booking.v1.HoldSeatsRequest
+	6, // 7: booking.v1.BookingService.PayReservation:input_type -> booking.v1.PayReservationRequest
+	2, // 8: booking.v1.BookingService.SeedEvent:output_type -> booking.v1.SeedEventResponse
+	4, // 9: booking.v1.BookingService.HoldSeats:output_type -> booking.v1.HoldSeatsResponse
+	7, // 10: booking.v1.BookingService.PayReservation:output_type -> booking.v1.PayReservationResponse
+	8, // [8:11] is the sub-list for method output_type
+	5, // [5:8] is the sub-list for method input_type
+	5, // [5:5] is the sub-list for extension type_name
+	5, // [5:5] is the sub-list for extension extendee
+	0, // [0:5] is the sub-list for field type_name
 }
 
 func init() { file_booking_v1_booking_proto_init() }
@@ -454,7 +697,7 @@ func file_booking_v1_booking_proto_init() {
 			GoPackagePath: reflect.TypeOf(x{}).PkgPath(),
 			RawDescriptor: unsafe.Slice(unsafe.StringData(file_booking_v1_booking_proto_rawDesc), len(file_booking_v1_booking_proto_rawDesc)),
 			NumEnums:      0,
-			NumMessages:   5,
+			NumMessages:   8,
 			NumExtensions: 0,
 			NumServices:   1,
 		},

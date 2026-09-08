@@ -4,8 +4,10 @@
 // - protoc             (unknown)
 // source: booking/v1/booking.proto
 
-// Booking service contract. P1 exposes exactly the two operations the gateway
-// routes today; the seat-state authority's own logic is untouched by this file.
+// Booking service contract. P2 adds the saga entry point: holding seats and
+// paying for them are two operations, not one, because the attendee gets a
+// 10-minute checkout window between them (PRD §4.1 steps 4-5) and because the
+// hold transaction must commit before Payment is called (D4).
 
 package bookingv1
 
@@ -22,8 +24,9 @@ import (
 const _ = grpc.SupportPackageIsVersion9
 
 const (
-	BookingService_SeedEvent_FullMethodName = "/booking.v1.BookingService/SeedEvent"
-	BookingService_HoldSeats_FullMethodName = "/booking.v1.BookingService/HoldSeats"
+	BookingService_SeedEvent_FullMethodName      = "/booking.v1.BookingService/SeedEvent"
+	BookingService_HoldSeats_FullMethodName      = "/booking.v1.BookingService/HoldSeats"
+	BookingService_PayReservation_FullMethodName = "/booking.v1.BookingService/PayReservation"
 )
 
 // BookingServiceClient is the client API for BookingService service.
@@ -32,6 +35,7 @@ const (
 type BookingServiceClient interface {
 	SeedEvent(ctx context.Context, in *SeedEventRequest, opts ...grpc.CallOption) (*SeedEventResponse, error)
 	HoldSeats(ctx context.Context, in *HoldSeatsRequest, opts ...grpc.CallOption) (*HoldSeatsResponse, error)
+	PayReservation(ctx context.Context, in *PayReservationRequest, opts ...grpc.CallOption) (*PayReservationResponse, error)
 }
 
 type bookingServiceClient struct {
@@ -62,12 +66,23 @@ func (c *bookingServiceClient) HoldSeats(ctx context.Context, in *HoldSeatsReque
 	return out, nil
 }
 
+func (c *bookingServiceClient) PayReservation(ctx context.Context, in *PayReservationRequest, opts ...grpc.CallOption) (*PayReservationResponse, error) {
+	cOpts := append([]grpc.CallOption{grpc.StaticMethod()}, opts...)
+	out := new(PayReservationResponse)
+	err := c.cc.Invoke(ctx, BookingService_PayReservation_FullMethodName, in, out, cOpts...)
+	if err != nil {
+		return nil, err
+	}
+	return out, nil
+}
+
 // BookingServiceServer is the server API for BookingService service.
 // All implementations must embed UnimplementedBookingServiceServer
 // for forward compatibility.
 type BookingServiceServer interface {
 	SeedEvent(context.Context, *SeedEventRequest) (*SeedEventResponse, error)
 	HoldSeats(context.Context, *HoldSeatsRequest) (*HoldSeatsResponse, error)
+	PayReservation(context.Context, *PayReservationRequest) (*PayReservationResponse, error)
 	mustEmbedUnimplementedBookingServiceServer()
 }
 
@@ -83,6 +98,9 @@ func (UnimplementedBookingServiceServer) SeedEvent(context.Context, *SeedEventRe
 }
 func (UnimplementedBookingServiceServer) HoldSeats(context.Context, *HoldSeatsRequest) (*HoldSeatsResponse, error) {
 	return nil, status.Errorf(codes.Unimplemented, "method HoldSeats not implemented")
+}
+func (UnimplementedBookingServiceServer) PayReservation(context.Context, *PayReservationRequest) (*PayReservationResponse, error) {
+	return nil, status.Errorf(codes.Unimplemented, "method PayReservation not implemented")
 }
 func (UnimplementedBookingServiceServer) mustEmbedUnimplementedBookingServiceServer() {}
 func (UnimplementedBookingServiceServer) testEmbeddedByValue()                        {}
@@ -141,6 +159,24 @@ func _BookingService_HoldSeats_Handler(srv interface{}, ctx context.Context, dec
 	return interceptor(ctx, in, info, handler)
 }
 
+func _BookingService_PayReservation_Handler(srv interface{}, ctx context.Context, dec func(interface{}) error, interceptor grpc.UnaryServerInterceptor) (interface{}, error) {
+	in := new(PayReservationRequest)
+	if err := dec(in); err != nil {
+		return nil, err
+	}
+	if interceptor == nil {
+		return srv.(BookingServiceServer).PayReservation(ctx, in)
+	}
+	info := &grpc.UnaryServerInfo{
+		Server:     srv,
+		FullMethod: BookingService_PayReservation_FullMethodName,
+	}
+	handler := func(ctx context.Context, req interface{}) (interface{}, error) {
+		return srv.(BookingServiceServer).PayReservation(ctx, req.(*PayReservationRequest))
+	}
+	return interceptor(ctx, in, info, handler)
+}
+
 // BookingService_ServiceDesc is the grpc.ServiceDesc for BookingService service.
 // It's only intended for direct use with grpc.RegisterService,
 // and not to be introspected or modified (even as a copy)
@@ -155,6 +191,10 @@ var BookingService_ServiceDesc = grpc.ServiceDesc{
 		{
 			MethodName: "HoldSeats",
 			Handler:    _BookingService_HoldSeats_Handler,
+		},
+		{
+			MethodName: "PayReservation",
+			Handler:    _BookingService_PayReservation_Handler,
 		},
 	},
 	Streams:  []grpc.StreamDesc{},

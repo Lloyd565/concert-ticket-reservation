@@ -1,7 +1,9 @@
 syntax = "proto3";
 
-// Booking service contract. P1 exposes exactly the two operations the gateway
-// routes today; the seat-state authority's own logic is untouched by this file.
+// Booking service contract. P2 adds the saga entry point: holding seats and
+// paying for them are two operations, not one, because the attendee gets a
+// 10-minute checkout window between them (PRD §4.1 steps 4-5) and because the
+// hold transaction must commit before Payment is called (D4).
 package booking.v1;
 
 import "google/protobuf/timestamp.proto";
@@ -46,9 +48,44 @@ message HoldSeatsRequest {
 message HoldSeatsResponse {
   string reservation_id = 1;
   google.protobuf.Timestamp expires_at = 2;
+  // What the caller owes. P2 prices a seat map at a flat per-seat rate; tiered
+  // pricing arrives with the organizer flow.
+  int64 total_cents = 3;
+}
+
+message Ticket {
+  string id = 1;
+  string seat_id = 2;
+  string qr_code = 3;
+}
+
+// PayReservationRequest drives the reservation saga to a conclusion.
+message PayReservationRequest {
+  string reservation_id = 1;
+  // The authenticated subject, set by the gateway from the validated token.
+  // Booking checks it against the reservation's owner: a reservation ID is not
+  // a capability.
+  string user_id = 2;
+  // Required (AGENTS.md §2 rule 10). Note that the *charge* is made idempotent
+  // by the reservation ID rather than by this key - see the saga use case for
+  // why the reservation is the stronger scope.
+  string idempotency_key = 3;
+}
+
+message PayReservationResponse {
+  string reservation_id = 1;
+  // Reservation status after the attempt: confirmed, failed, or pending when
+  // the payment outcome is unknown and reconciliation now owns the row (D8).
+  string status = 2;
+  // Set only when status is confirmed.
+  string booking_id = 3;
+  repeated Ticket tickets = 4;
+  // Set only when status is failed.
+  string decline_reason = 5;
 }
 
 service BookingService {
   rpc SeedEvent(SeedEventRequest) returns (SeedEventResponse);
   rpc HoldSeats(HoldSeatsRequest) returns (HoldSeatsResponse);
+  rpc PayReservation(PayReservationRequest) returns (PayReservationResponse);
 }
