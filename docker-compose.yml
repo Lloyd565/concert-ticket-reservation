@@ -1,11 +1,12 @@
-# Local stack. P1 scope: Postgres (booking_db), auth_db, Booking, Auth, Gateway.
-# Payment, Notification, Redis, RabbitMQ, Jaeger, Prometheus, Grafana and the
-# seed job are added in their own phases (P2-P5).
+# Local stack. P2 scope: Postgres (booking_db), auth_db, payment_db, Booking,
+# Auth, Payment, Gateway. Notification, Redis, RabbitMQ, Jaeger, Prometheus,
+# Grafana and the seed job are added in their own phases (P3-P5).
 #
-# There are no start-order dependencies between the three services. Each waits
-# only on its own database, and the gateway waits on nothing: it dials Auth and
-# Booking lazily, so it serves whether they are up yet or not
-# (ARCHITECTURE.md §3.3).
+# There are no start-order dependencies between the four services. Each waits
+# only on its own database; the gateway waits on nothing because it dials Auth
+# and Booking lazily, and Booking does not wait on Payment because it dials it
+# lazily too - holds and seat maps work with Payment down, and only the pay step
+# does not (ARCHITECTURE.md §3.3).
 #
 # Build contexts are the repository root because every service depends on the
 # shared proto module through a replace directive.
@@ -46,6 +47,55 @@ services:
       retries: 10
       start_period: 10s
 
+  # A third container, not a third database in one of the others: database per
+  # service (D2). Payment's data is the only data in the system that is about
+  # money, and NFR-5.4 keeps it that way.
+  payment_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${PAYMENT_DB_NAME:-payment_db}
+    ports:
+      - "${PAYMENT_POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - paymentdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${PAYMENT_DB_NAME:-payment_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  payment:
+    build:
+      context: .
+      dockerfile: services/payment/Dockerfile
+    environment:
+      PAYMENT_HTTP_PORT: "8082"
+      PAYMENT_GRPC_PORT: "9093"
+      PAYMENT_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@payment_db:5432/${PAYMENT_DB_NAME:-payment_db}?sslmode=disable
+      # succeed | decline | hang. Real money is out of scope; this is the knob
+      # that makes the saga's compensation paths demonstrable in a running
+      # stack. Set it to hang and watch the reconciliation job resolve holds
+      # rather than the sweeper releasing them.
+      PAYMENT_PROVIDER_MODE: ${PAYMENT_PROVIDER_MODE:-succeed}
+      PAYMENT_PROVIDER_LATENCY: ${PAYMENT_PROVIDER_LATENCY:-0s}
+      PAYMENT_PROVIDER_TIMEOUT: ${PAYMENT_PROVIDER_TIMEOUT:-3s}
+      PAYMENT_PROVIDER_MAX_ATTEMPTS: ${PAYMENT_PROVIDER_MAX_ATTEMPTS:-2}
+    ports:
+      - "${PAYMENT_HTTP_PORT:-8082}:8082"
+      - "${PAYMENT_GRPC_PORT:-9093}:9093"
+    depends_on:
+      payment_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
   booking:
     build:
       context: .
@@ -57,6 +107,17 @@ services:
       BOOKING_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${BOOKING_DB_NAME:-booking_db}?sslmode=disable
       BOOKING_HOLD_TTL: ${BOOKING_HOLD_TTL:-10m}
       BOOKING_SWEEP_INTERVAL: ${BOOKING_SWEEP_INTERVAL:-5s}
+      # The one synchronous service-to-service call in the system. Dialled
+      # lazily - deliberately no depends_on below (ARCHITECTURE.md §3.3).
+      BOOKING_PAYMENT_ADDR: payment:9093
+      BOOKING_PAYMENT_TIMEOUT: ${BOOKING_PAYMENT_TIMEOUT:-3s}
+      BOOKING_BREAKER_THRESHOLD: ${BOOKING_BREAKER_THRESHOLD:-5}
+      BOOKING_BREAKER_COOLDOWN: ${BOOKING_BREAKER_COOLDOWN:-30s}
+      # Reconciliation owns every reservation whose payment outcome is unknown;
+      # the sweeper is forbidden to touch them (D8). It must therefore run well
+      # inside the hold TTL, or nothing ever releases those seats.
+      BOOKING_RECONCILE_INTERVAL: ${BOOKING_RECONCILE_INTERVAL:-15s}
+      BOOKING_RECONCILE_GRACE: ${BOOKING_RECONCILE_GRACE:-30s}
     ports:
       - "${BOOKING_HTTP_PORT:-8080}:8080"
       - "${BOOKING_GRPC_PORT:-9092}:9092"
@@ -134,3 +195,4 @@ services:
 volumes:
   pgdata:
   authdata:
+  paymentdata:
