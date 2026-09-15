@@ -101,7 +101,7 @@ func (r *Refunder) Refund(ctx context.Context, in RefundInput) (domain.Refund, e
 		return domain.Refund{}, err
 	}
 
-	return r.callProvider(ctx, rf, charge.ProviderRef)
+	return r.callProvider(ctx, rf, charge)
 }
 
 // resume returns a settled refund unchanged, or re-drives an unsettled one.
@@ -118,15 +118,15 @@ func (r *Refunder) resume(ctx context.Context, existing domain.Refund, amountCen
 		return domain.Refund{}, err
 	}
 	r.log.InfoContext(ctx, "resuming an unsettled refund", "refund_id", existing.ID, "idempotency_key", existing.IdempotencyKey)
-	return r.callProvider(ctx, existing, charge.ProviderRef)
+	return r.callProvider(ctx, existing, charge)
 }
 
 // callProvider drives a pending refund to a settled state, or leaves it pending.
-func (r *Refunder) callProvider(ctx context.Context, rf domain.Refund, chargeRef string) (domain.Refund, error) {
+func (r *Refunder) callProvider(ctx context.Context, rf domain.Refund, charge domain.Charge) (domain.Refund, error) {
 	callCtx, cancel := context.WithTimeout(ctx, r.providerTimeout)
 	defer cancel()
 
-	res, err := r.provider.Refund(callCtx, rf.IdempotencyKey, chargeRef, rf.AmountCents)
+	res, err := r.provider.Refund(callCtx, rf.IdempotencyKey, charge.ProviderRef, rf.AmountCents)
 	if err != nil {
 		// Unknown, not failed. Same rule as a charge: leave the row pending so
 		// a retry under this key can resolve it.
@@ -153,7 +153,20 @@ func (r *Refunder) callProvider(ctx context.Context, rf domain.Refund, chargeRef
 	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
 	defer cancelSettle()
 
-	ok, err := r.refunds.SettleRefund(settleCtx, settled)
+	// refund.completed is written by the settling statement itself (D9). Only
+	// money actually given back is announced: a failed refund changed nothing
+	// anyone downstream could act on.
+	eventType, payload := "", any(nil)
+	if settled.Status == domain.RefundSucceeded {
+		eventType = domain.EventRefundCompleted
+		payload = domain.RefundCompletedEvent{
+			RefundID:      settled.ID,
+			ChargeID:      charge.ID,
+			ReservationID: charge.ReservationID,
+			AmountCents:   settled.AmountCents,
+		}
+	}
+	ok, err := r.refunds.SettleRefund(settleCtx, settled, eventType, payload)
 	if err != nil {
 		return domain.Refund{}, err
 	}

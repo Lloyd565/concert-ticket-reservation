@@ -23,6 +23,16 @@ type Charge struct {
 	UpdatedAt      time.Time
 }
 
+type Outbox struct {
+	ID           uuid.UUID
+	AggregateID  uuid.UUID
+	EventType    string
+	Payload      []byte
+	CreatedAt    time.Time
+	PublishedAt  *time.Time
+	ClaimedUntil *time.Time
+}
+
 type Refund struct {
 	ID             uuid.UUID
 	ChargeID       uuid.UUID

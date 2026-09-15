@@ -87,12 +87,17 @@ func (r *Repo) FindChargeByID(ctx context.Context, id string) (domain.Charge, er
 	return toCharge(row), nil
 }
 
-// SettleCharge records a terminal outcome, reporting whether the row was still
-// pending and therefore whether this result is the authoritative one.
-func (r *Repo) SettleCharge(ctx context.Context, c domain.Charge) (bool, error) {
+// SettleCharge records a terminal outcome and the event announcing it, in one
+// statement, reporting whether the row was still pending and therefore whether
+// this result is the authoritative one. A losing duplicate records no event.
+func (r *Repo) SettleCharge(ctx context.Context, c domain.Charge, eventType string, payload any) (bool, error) {
 	id, err := uuid.Parse(c.ID)
 	if err != nil {
 		return false, fmt.Errorf("parse charge id %q: %w", c.ID, domain.ErrInvalidInput)
+	}
+	eventID, body, err := encodeEvent(ctx, eventType, c.UpdatedAt, payload)
+	if err != nil {
+		return false, err
 	}
 	n, err := r.queries.SettleCharge(ctx, SettleChargeParams{
 		Status:        string(c.Status),
@@ -100,6 +105,9 @@ func (r *Repo) SettleCharge(ctx context.Context, c domain.Charge) (bool, error) 
 		DeclineReason: nullable(c.DeclineReason),
 		UpdatedAt:     c.UpdatedAt,
 		ID:            id,
+		EventID:       eventID,
+		EventType:     eventType,
+		Payload:       body,
 	})
 	if err != nil {
 		return false, fmt.Errorf("settle charge: %w", err)
@@ -147,18 +155,25 @@ func (r *Repo) FindRefundByIdempotencyKey(ctx context.Context, key string) (doma
 	return toRefund(row), nil
 }
 
-// SettleRefund records a terminal outcome, reporting whether the row was still
-// pending.
-func (r *Repo) SettleRefund(ctx context.Context, rf domain.Refund) (bool, error) {
+// SettleRefund records a terminal outcome, and its event when eventType is not
+// empty, in one statement, reporting whether the row was still pending.
+func (r *Repo) SettleRefund(ctx context.Context, rf domain.Refund, eventType string, payload any) (bool, error) {
 	id, err := uuid.Parse(rf.ID)
 	if err != nil {
 		return false, fmt.Errorf("parse refund id %q: %w", rf.ID, domain.ErrInvalidInput)
+	}
+	eventID, body, err := encodeEvent(ctx, eventType, rf.UpdatedAt, payload)
+	if err != nil {
+		return false, err
 	}
 	n, err := r.queries.SettleRefund(ctx, SettleRefundParams{
 		Status:      string(rf.Status),
 		ProviderRef: nullable(rf.ProviderRef),
 		UpdatedAt:   rf.UpdatedAt,
 		ID:          id,
+		EventID:     eventID,
+		EventType:   eventType,
+		Payload:     body,
 	})
 	if err != nil {
 		return false, fmt.Errorf("settle refund: %w", err)

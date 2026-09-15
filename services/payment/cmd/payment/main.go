@@ -26,6 +26,7 @@ import (
 
 	paymentv1 "github.com/lloyd565/concert-ticket-reservation/proto/payment/v1"
 	"github.com/lloyd565/concert-ticket-reservation/services/payment/internal/config"
+	"github.com/lloyd565/concert-ticket-reservation/services/payment/internal/events"
 	"github.com/lloyd565/concert-ticket-reservation/services/payment/internal/logging"
 	"github.com/lloyd565/concert-ticket-reservation/services/payment/internal/provider"
 	"github.com/lloyd565/concert-ticket-reservation/services/payment/internal/repository/postgres"
@@ -61,6 +62,12 @@ func run(log *slog.Logger) error {
 	prov := provider.NewMock(cfg.ProviderMode, cfg.ProviderLatency)
 	charger := usecase.NewCharger(repo, prov, cfg.ProviderTimeout, cfg.ProviderMaxAttempts, log)
 	refunder := usecase.NewRefunder(repo, repo, prov, cfg.ProviderTimeout, log)
+
+	// Settling a charge or a refund writes its event to the outbox in the same
+	// statement (D9); the relay drains it. Lazily connected, so Payment keeps
+	// answering Booking with RabbitMQ down, and its events wait (§3.3).
+	relay := events.NewRelay(cfg.AMQPURL, repo, log)
+	go relay.Run(ctx)
 
 	grpcSrv := grpc.NewServer(grpc.ChainUnaryInterceptor(logging.UnaryServerInterceptor()))
 	paymentv1.RegisterPaymentServiceServer(grpcSrv, paymentgrpc.NewServer(charger, refunder, log))

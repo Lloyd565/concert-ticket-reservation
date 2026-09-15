@@ -12,6 +12,64 @@ import (
 	"github.com/google/uuid"
 )
 
+const claimOutboxBatch = `-- name: ClaimOutboxBatch :many
+WITH batch AS (
+    SELECT o.id
+    FROM outbox o
+    WHERE o.published_at IS NULL
+      AND (o.claimed_until IS NULL OR o.claimed_until < now())
+    ORDER BY o.created_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE outbox
+SET claimed_until = now() + make_interval(0, 0, 0, 0, 0, 0, $1::float8)
+FROM batch
+WHERE outbox.id = batch.id
+RETURNING outbox.id, outbox.event_type, outbox.payload, outbox.created_at
+`
+
+type ClaimOutboxBatchParams struct {
+	LeaseSeconds float64
+	BatchSize    int32
+}
+
+type ClaimOutboxBatchRow struct {
+	ID        uuid.UUID
+	EventType string
+	Payload   []byte
+	CreatedAt time.Time
+}
+
+// Leases a batch of unpublished rows to one relay, and commits at once. No lock
+// is held while publishing (D4); the lease is what keeps two relays apart, and a
+// lapsed one makes the row claimable again. Measured on the database clock, the
+// clock that checks it. RETURNING has no order; the caller sorts.
+func (q *Queries) ClaimOutboxBatch(ctx context.Context, arg ClaimOutboxBatchParams) ([]ClaimOutboxBatchRow, error) {
+	rows, err := q.db.Query(ctx, claimOutboxBatch, arg.LeaseSeconds, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimOutboxBatchRow
+	for rows.Next() {
+		var i ClaimOutboxBatchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventType,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const createCharge = `-- name: CreateCharge :exec
 
 INSERT INTO charges (id, reservation_id, user_id, amount_cents, status, idempotency_key, created_at, updated_at)
@@ -154,14 +212,35 @@ func (q *Queries) GetRefundByIdempotencyKey(ctx context.Context, idempotencyKey 
 	return i, err
 }
 
-const settleCharge = `-- name: SettleCharge :execrows
-UPDATE charges
-SET status         = $1,
-    provider_ref   = $2,
-    decline_reason = $3,
-    updated_at     = $4
-WHERE id = $5
-  AND status = 'pending'
+const markOutboxPublished = `-- name: MarkOutboxPublished :exec
+UPDATE outbox
+SET published_at = now()
+WHERE id = ANY ($1::uuid[])
+`
+
+// Runs only for rows the broker has confirmed. A crash before this line means a
+// duplicate publish once the lease lapses - never a loss.
+func (q *Queries) MarkOutboxPublished(ctx context.Context, ids []uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markOutboxPublished, ids)
+	return err
+}
+
+const settleCharge = `-- name: SettleCharge :one
+WITH settled AS (
+    UPDATE charges
+    SET status         = $1,
+        provider_ref   = $2,
+        decline_reason = $3,
+        updated_at     = $4
+    WHERE charges.id = $5
+      AND charges.status = 'pending'
+    RETURNING charges.id
+), announced AS (
+    INSERT INTO outbox (id, aggregate_id, event_type, payload, created_at)
+    SELECT $6::uuid, settled.id, $7::text, $8::jsonb, $4
+    FROM settled
+)
+SELECT count(*) FROM settled
 `
 
 type SettleChargeParams struct {
@@ -170,6 +249,9 @@ type SettleChargeParams struct {
 	DeclineReason *string
 	UpdatedAt     time.Time
 	ID            uuid.UUID
+	EventID       uuid.UUID
+	EventType     string
+	Payload       []byte
 }
 
 // status = 'pending' in the WHERE clause is the guard, not decoration: two
@@ -177,27 +259,44 @@ type SettleChargeParams struct {
 // first settled result is the authoritative one. Without this predicate the
 // later writer would silently overwrite it - which for a succeeded charge means
 // losing the provider reference the refund depends on.
+//
+// P4: the settlement's event is written by the same statement (D9). The outbox
+// row is selected FROM the update, so it exists exactly when the update moved a
+// row: a losing duplicate settles nothing and announces nothing, and there is no
+// moment at which the charge is settled but its event is not yet recorded.
+// Returns how many charges were settled: 1, or 0 for the loser.
 func (q *Queries) SettleCharge(ctx context.Context, arg SettleChargeParams) (int64, error) {
-	result, err := q.db.Exec(ctx, settleCharge,
+	row := q.db.QueryRow(ctx, settleCharge,
 		arg.Status,
 		arg.ProviderRef,
 		arg.DeclineReason,
 		arg.UpdatedAt,
 		arg.ID,
+		arg.EventID,
+		arg.EventType,
+		arg.Payload,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }
 
-const settleRefund = `-- name: SettleRefund :execrows
-UPDATE refunds
-SET status       = $1,
-    provider_ref = $2,
-    updated_at   = $3
-WHERE id = $4
-  AND status = 'pending'
+const settleRefund = `-- name: SettleRefund :one
+WITH settled AS (
+    UPDATE refunds
+    SET status       = $1,
+        provider_ref = $2,
+        updated_at   = $3
+    WHERE refunds.id = $4
+      AND refunds.status = 'pending'
+    RETURNING refunds.id
+), announced AS (
+    INSERT INTO outbox (id, aggregate_id, event_type, payload, created_at)
+    SELECT $5::uuid, settled.id, $6::text, $7::jsonb, $3
+    FROM settled
+    WHERE $6::text <> ''
+)
+SELECT count(*) FROM settled
 `
 
 type SettleRefundParams struct {
@@ -205,18 +304,25 @@ type SettleRefundParams struct {
 	ProviderRef *string
 	UpdatedAt   time.Time
 	ID          uuid.UUID
+	EventID     uuid.UUID
+	EventType   string
+	Payload     []byte
 }
 
-// Same guard as SettleCharge, for the same reason.
+// Same guard as SettleCharge, for the same reason, and the same single
+// statement for the event. A refund that failed announces nothing: @event_type
+// is empty and the INSERT selects no row.
 func (q *Queries) SettleRefund(ctx context.Context, arg SettleRefundParams) (int64, error) {
-	result, err := q.db.Exec(ctx, settleRefund,
+	row := q.db.QueryRow(ctx, settleRefund,
 		arg.Status,
 		arg.ProviderRef,
 		arg.UpdatedAt,
 		arg.ID,
+		arg.EventID,
+		arg.EventType,
+		arg.Payload,
 	)
-	if err != nil {
-		return 0, err
-	}
-	return result.RowsAffected(), nil
+	var count int64
+	err := row.Scan(&count)
+	return count, err
 }

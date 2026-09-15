@@ -37,6 +37,10 @@ type Config struct {
 	// ProviderMaxAttempts bounds retries (FR-4.4). Safe only because the
 	// idempotency key is passed through to the provider.
 	ProviderMaxAttempts int
+	// AMQPURL is the broker the outbox relay publishes to (D9). It is never on
+	// the path of a charge: with RabbitMQ down, events wait in the outbox. It
+	// carries credentials, so it has no default.
+	AMQPURL string
 }
 
 // Load reads configuration from the environment. It fails fast: a service that
@@ -44,6 +48,7 @@ type Config struct {
 func Load() (Config, error) {
 	cfg := Config{
 		DatabaseURL:         os.Getenv("PAYMENT_DATABASE_URL"),
+		AMQPURL:             os.Getenv("PAYMENT_AMQP_URL"),
 		HTTPPort:            env("PAYMENT_HTTP_PORT", "8082"),
 		GRPCPort:            env("PAYMENT_GRPC_PORT", "9093"),
 		ProviderLatency:     0,
@@ -52,6 +57,11 @@ func Load() (Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("PAYMENT_DATABASE_URL is required")
+	}
+	if cfg.AMQPURL == "" {
+		// Required even though the broker may be down: a relay with nowhere to
+		// publish would let the outbox grow forever while reporting healthy.
+		return Config{}, fmt.Errorf("PAYMENT_AMQP_URL is required")
 	}
 
 	mode, err := provider.ParseMode(env("PAYMENT_PROVIDER_MODE", string(provider.ModeSucceed)))

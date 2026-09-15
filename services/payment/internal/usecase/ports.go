@@ -29,7 +29,10 @@ type ChargeRepository interface {
 	// SettleCharge records a terminal outcome. It only affects a row that is
 	// still pending, so a late-arriving second result cannot overwrite a
 	// settled one, and reports whether it did.
-	SettleCharge(ctx context.Context, c domain.Charge) (bool, error)
+	//
+	// The event announcing the outcome is recorded by the same statement (D9),
+	// and only if this call was the one that settled the charge.
+	SettleCharge(ctx context.Context, c domain.Charge, eventType string, payload any) (bool, error)
 }
 
 // RefundRepository is the refund port. Shaped exactly like ChargeRepository
@@ -37,7 +40,9 @@ type ChargeRepository interface {
 type RefundRepository interface {
 	CreateRefund(ctx context.Context, r domain.Refund) error
 	FindRefundByIdempotencyKey(ctx context.Context, key string) (domain.Refund, error)
-	SettleRefund(ctx context.Context, r domain.Refund) (bool, error)
+	// SettleRefund is SettleCharge for refunds. An empty eventType records no
+	// event.
+	SettleRefund(ctx context.Context, r domain.Refund, eventType string, payload any) (bool, error)
 }
 
 // Provider is the payment provider port (ARCHITECTURE.md §7: a mock adapter

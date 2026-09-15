@@ -211,7 +211,18 @@ func (c *Charger) callProvider(ctx context.Context, ch domain.Charge) (domain.Ch
 	// The UPDATE only touches rows that are still pending. If it changed
 	// nothing, another attempt under this key settled first; that result is
 	// authoritative and this one is a duplicate of it.
-	ok, err := c.charges.SettleCharge(settleCtx, settled)
+	//
+	// payment.succeeded or payment.failed is written by that same statement
+	// (D9). A settled charge never exists without its event, and a duplicate
+	// that loses the race announces nothing.
+	ok, err := c.charges.SettleCharge(settleCtx, settled, settled.SettledEventType(), domain.ChargeSettledEvent{
+		ChargeID:      settled.ID,
+		ReservationID: settled.ReservationID,
+		UserID:        settled.UserID,
+		AmountCents:   settled.AmountCents,
+		Status:        string(settled.Status),
+		DeclineReason: settled.DeclineReason,
+	})
 	if err != nil {
 		return domain.Charge{}, err
 	}
