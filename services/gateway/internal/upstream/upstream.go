@@ -33,9 +33,20 @@ const CorrelationMetadataKey = "x-correlation-id"
 //
 // Credentials are insecure because this hop never leaves the compose network.
 // It becomes mTLS the moment it does.
+//
+// Calls are balanced round-robin across every address the name resolves to.
+// Booking runs as several replicas behind one DNS name (grpc.NewClient resolves
+// a bare host:port through DNS), and gRPC's default policy, pick_first, would
+// pin every call to whichever replica answered first: the others would run and
+// take no traffic, with nothing visibly wrong.
+//
+// ponytail: DNS is re-resolved only when a connection fails, so a replica added
+// with --scale after the gateway started gets traffic once a connection drops or
+// the gateway restarts. Real service discovery when replicas come and go live.
 func Dial(addr string, timeout time.Duration) (*grpc.ClientConn, error) {
 	conn, err := grpc.NewClient(addr,
 		grpc.WithTransportCredentials(insecure.NewCredentials()),
+		grpc.WithDefaultServiceConfig(`{"loadBalancingConfig": [{"round_robin": {}}]}`),
 		grpc.WithChainUnaryInterceptor(correlationInterceptor(), timeoutInterceptor(timeout)),
 	)
 	if err != nil {
