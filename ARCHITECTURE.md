@@ -150,6 +150,12 @@ Used for anything the caller doesn't need an immediate answer to. Topic exchange
 
 Consumers must be **idempotent** — at-least-once delivery means duplicates will happen. Each consumer records processed `event_id`s and skips repeats.
 
+**As built in P4**, the only consumer is Notification. The saga stays orchestrated over gRPC (D7), so Booking does not consume `payment.*`; and Booking consuming `refund.completed` waits for a refund-request flow, which does not exist yet (§6.2 row 5). Every event in the table is still published.
+
+**Topology.** One durable topic exchange, `concert.events`, with the event type as routing key; every publisher and consumer declares it, so no start order matters. Each consumer owns and declares its own durable queue, its bindings and its dead-letter queue — Notification's are `notification.events` (bound to `booking.confirmed`, `reservation.expired`, `booking.refunded`) and `notification.dlx` → `notification.dlq`. An event no queue is bound to is confirmed by the broker and dropped, which is correct: nobody has asked for it.
+
+A queue declared by its consumer exists only after that consumer has started once, and an event published before then is unroutable. Compose waits for Notification's readiness, and ready means consuming, so on every normal start the queue exists before anything can be booked. Loading the topology from a broker definitions file is the upgrade if Notification must be able to miss the broker's very first boot.
+
 ### 4.3 Transactional outbox
 
 A service must never write to its database and publish to the broker as if they were one atomic operation — they aren't, and a crash between them silently loses the event.
@@ -157,6 +163,40 @@ A service must never write to its database and publish to the broker as if they 
 Pattern: within the same DB transaction as the state change, insert the event into an `outbox` table. A separate relay polls unpublished outbox rows, publishes them to RabbitMQ, and marks them sent. This guarantees at-least-once publication with no lost events.
 
 Applied in: Booking and Payment.
+
+**The crash this exists for.** `ConfirmPaid` commits the booking — seats booked, reservation confirmed, tickets issued — and the process dies before its publish of `booking.confirmed` reaches the broker (a deploy's SIGKILL, an OOM kill). Nothing afterwards knows an event was owed: no error was logged by the dead process, a retried `Pay` answers from the existing booking, and reconciliation never scans a confirmed reservation. The customer has paid and never receives their tickets, and no table, log or metric shows it. Publishing before `COMMIT` swaps the failure for a phantom one — tickets emailed for a booking that rolled back — and publishing without confirms loses an event whenever the broker dies with it still in a buffer.
+
+**Joining the transaction.** Booking's `Repo.Enqueue` takes the ambient transaction from the context and *refuses* to run without one, rather than falling back to the pool: an event written on its own connection is exactly the two-step write this rules out. Payment has no transactions (every write is one statement), so the settle `UPDATE` and the outbox `INSERT` are one statement — a data-modifying CTE whose `INSERT` selects from the `UPDATE`. The event exists exactly when the settlement does, and a duplicate that loses the `status = 'pending'` guard announces nothing.
+
+| Event | Written by, in the same transaction or statement |
+|---|---|
+| `reservation.held` | `Holder.HoldSeats`, with the reservation and its seats |
+| `booking.confirmed` | `Saga.ConfirmPaid`, with the booking and its tickets — the payload carries the tickets |
+| `booking.refunded` | `Saga.ReleaseRefunded` |
+| `reservation.expired` | `Expirer.ExpireOnce`, with the `pending → expired` update (§6.2) |
+| `payment.succeeded` / `payment.failed` | `SettleCharge` — never for a charge left `pending` (D8) |
+| `refund.completed` | `SettleRefund`, for a succeeded refund only |
+
+A release on decline or on "no charge" publishes nothing: the customer learned the outcome synchronously, and no consumer needs it.
+
+**The relay** (`services/{booking,payment}/internal/events/relay.go`) runs once per process, every second:
+
+1. Connect first. A relay that cannot reach the broker leases nothing, so it never holds rows back from one that can.
+2. Lease a batch: one statement sets `claimed_until = now() + 30s` on up to 100 unpublished, unleased rows and commits. `FOR UPDATE SKIP LOCKED` lives inside that statement only.
+3. Publish the batch with nothing locked — a transaction may not span the broker call (D4) — as persistent messages, `message_id` = event ID, with publisher confirms.
+4. Mark only the rows the broker acked. A nack, a timeout or a dropped channel leaves the row leased until the lease lapses, and it is published again.
+
+The lease, not a row lock, is what keeps two Booking replicas from both publishing a row, and it is measured on the database clock so replica skew cannot shorten it.
+
+| Failure | Outcome |
+|---|---|
+| Crash before `COMMIT` | Neither the change nor its event exists |
+| Crash after `COMMIT`, before publish | The row waits; the next pass publishes it |
+| Crash after publish, before the confirm | Unmarked; published again once the lease lapses — a duplicate |
+| Crash after the confirm, before the mark | The same duplicate |
+| Broker down | Nothing is leased; rows accumulate; no request fails (§3.3) |
+
+Publication is therefore at-least-once and never at-most-once, and D10 is what makes the duplicates harmless. Within one batch events go out oldest first; across two replicas' batches they can interleave, so consumers must not depend on order. Published rows are kept — a retention job is the upgrade when the table's size matters.
 
 ### 4.4 Access-token validation is local to the gateway
 
@@ -185,6 +225,21 @@ The cost is 15 minutes of stale authorization. The purchase is that Auth is not 
 **Fine-grained authorization stays downstream.** The gateway decides *who* the caller is and whether their role may reach a route; it never decides whether they own a particular reservation. That question belongs to the service that owns the data.
 
 Symmetric HS256 is used because the only verifier is the gateway, inside the same trust boundary. It does mean the gateway holds a key that can mint tokens; the move to RS256/EdDSA with a JWKS endpoint is warranted as soon as anything that should only verify needs the key.
+
+### 4.5 Consuming events: Notification
+
+Notification consumes `notification.events` with one consumer and a prefetch of 1, and every message goes through the same steps (`internal/usecase/notify.go`):
+
+1. **Has this event been processed?** A row in `processed_events` means yes: acknowledge and do nothing. This is asked before anything else, because duplicates are the normal case — the relay republishes after a crash between confirm and mark, and the broker redelivers whatever was not acknowledged.
+2. **Render** the email. Its notification ID *is* the event ID, so a redelivered event resumes its notification, and its attempt count, instead of starting another.
+3. **Send**, and on success record the attempt, mark the notification sent and insert `processed_events` in **one statement** — "sent" and "processed" cannot disagree.
+4. On failure, log the attempt and retry in process with exponential backoff and jitter (0.5s doubling, 5 attempts), the message still unacknowledged.
+
+The handler's error decides the message's fate: none acknowledges it; a permanent one — undecodable, an unknown event type, a malformed ID, or out of attempts — rejects it without requeue into `notification.dlq`, so a poison message never blocks the queue; anything else (the database is down, the service is shutting down) requeues it after a short delay. A dead-lettered event is not recorded as processed, so moving it back from the DLQ once delivery works sends the email.
+
+Two windows are left open deliberately, and both are marked in the code. A crash between the send and the statement that records it resends once on redelivery; closing it needs a provider that honours the notification ID as an idempotency key, as Payment's does. And duplicates are caught when they arrive in sequence, which one consumer with prefetch 1 guarantees; two replicas could each take a copy of one event at the same instant, so scaling out needs a lease on the notification row first, the relay's pattern.
+
+The mock mail provider addresses users by ID. Addresses live in `auth_db`, which Notification may not read (D2), and no event carries one yet.
 
 ## 5. Seat locking design
 
@@ -294,11 +349,11 @@ The reservation → payment → confirmation sequence spans Booking and Payment.
 |---|---|
 | Payment declined | Release seats → `available`, reservation → `failed`, publish `payment.failed` |
 | Payment call times out (result unknown) | Leave reservation `pending` — it was marked for reconciliation before the call, so this holds even if Booking dies mid-call; reconciliation job queries Payment by idempotency key. If charged → complete confirmation. If not → release seats. **Never blind-release on timeout** — the charge may have succeeded |
-| Hold expires before payment | The Redis TTL releases the seats, unaided. The reservation is left `pending` with a deadline in the past: expiry is a fact about the clock, derivable by anyone who asks, and the saga refuses to charge against it (FR-4.2). Rewriting the row would need a job scanning for closed windows — which is the sweeper, under a new name |
+| Hold expires before payment | The Redis TTL releases the seats, unaided, and the saga refuses to charge against a closed window (FR-4.2). Since P4 the expirer then moves the reservation `pending → expired` and writes `reservation.expired` in that transaction — a status and nothing else: no seat, no key, and never a reservation whose payment outcome is unknown (D8). See "The expirer is not the sweeper" below |
 | Payment succeeded but confirmation write fails | Reservation stays `pending`; reconciliation retries confirmation. If unrecoverable → automatic refund. Satisfies FR-5.3: never a paid-but-unbooked customer |
 | Refund requested on confirmed booking | Payment refunds → publishes `refund.completed` → Booking releases seats, booking → `refunded` |
 
-Each row is a separate named function in `services/booking/internal/usecase/saga.go`, not a branch of one handler: `ReleaseDeclined`, `LeavePendingForReconciliation`, `RefundUnconfirmable`, `ReleaseRefunded`. Row 3 has no function at all any more — it is the Redis TTL. Row 5's *trigger* is the `refund.completed` event and arrives with the broker in P4; its action half is built in P2 because row 4 is unfinished without it.
+Each row is a separate named function in `services/booking/internal/usecase/saga.go`, not a branch of one handler: `ReleaseDeclined`, `LeavePendingForReconciliation`, `RefundUnconfirmable`, `ReleaseRefunded`. Row 3's seat release has no function at all — it is the Redis TTL; its status change and event are `Expirer` in `expire.go`. Row 5's *trigger* is the `refund.completed` event: Payment publishes it from P4, but nothing in Booking consumes it yet, because no flow exists that refunds a *confirmed* booking. Its action half was built in P2 because row 4 is unfinished without it, and writes `booking.refunded` since P4.
 
 **The second way to violate D8.** The saga leaving a timed-out reservation `pending` is only half the rule, and the other half changed shape in P3.
 
@@ -307,6 +362,10 @@ In P0 the danger was the sweeper: it released any `pending` reservation past `ex
 Retiring the sweeper does not retire the danger. The Redis TTL now does exactly what the sweeper did, and there is no `WHERE` clause to add to it: it is not running any SQL and nobody asks it anything. So the guard has to be an *action* rather than a condition. `Saga.KeepHold` pushes the hold out by another checkout window — once when the outcome first becomes unknown, and again on every reconciliation pass that fails to resolve it, because one extension is good for one window and the case this exists for is Payment being unreachable for longer than that. `reservations.payment_pending_since` still marks the reservation, and reconciliation is still the only owner of those seats, which is why its interval must stay well inside the hold TTL; Booking refuses to start if it does not.
 
 Deleting that extension is a one-line change that breaks nothing visible and sells a paid customer's seat ten minutes later, so it has a test of its own (`TestHoldIsKeptAliveWhileThePaymentOutcomeIsUnknown`).
+
+**The expirer is not the sweeper.** P3 left a lapsed reservation `pending` with a past deadline, and that was right for seats. P4 needs `reservation.expired`, and an event needs a transaction to be written in (D9): emitting one for a reservation nothing updates is the lost-event write the outbox forbids. So `Expirer` moves `pending → expired` and records the event in that transaction. It differs from the retired sweeper in every way that mattered: it releases no seat and touches no Redis key — the TTL still owns the hold; it runs on every replica, because each row is claimed with `FOR UPDATE SKIP LOCKED` and guarded by its status in one statement; and it is late by up to a pass without consequence, because only an email waits on it.
+
+It is also the third place D8 has to hold. The statement skips any reservation with `payment_pending_since` set: expiring one would make a possibly-paid reservation one confirmation refuses, turning a charge that succeeded into a guaranteed refund. The guard races Pay safely in both directions — a mark committed first excludes the row, and an expiry committed first fails Pay's mark, which only counts a `pending` row, so no charge starts (`TestExpirerLeavesReservationsReconciliationOwns`).
 
 **A charge that succeeded but could not be confirmed** — the database was briefly unreachable, Redis was, the seats had already gone — is handed to reconciliation rather than returned as an error nobody follows up. There is a charge with no delivery, and reconciliation is the only component that resolves that: it asks Payment, gets `succeeded`, retries the confirm, and refunds if confirmation is genuinely impossible (row 4, FR-5.3).
 
@@ -401,7 +460,9 @@ reservation_seats (reservation_id, seat_id, confirmed_at, released_at)
 bookings      (id, reservation_id UNIQUE, user_id, payment_id,
                confirmed_at, status)
 tickets       (id, booking_id, seat_id, qr_code UNIQUE, issued_at)
-outbox        (id, aggregate_id, event_type, payload, created_at, published_at)
+outbox        (id, aggregate_id, event_type, payload, created_at, published_at,
+               claimed_until)  -- id is the event_id; payload is the complete
+                               -- envelope; claimed_until is a relay's lease (§4.3)
 ```
 
 ### redis
@@ -418,18 +479,23 @@ charges          (id, reservation_id, user_id, amount_cents, status,
                   provider_ref, idempotency_key UNIQUE, created_at, updated_at)
 refunds          (id, charge_id, amount_cents, status, provider_ref,
                   idempotency_key UNIQUE, created_at)
-outbox           (id, aggregate_id, event_type, payload, created_at, published_at)
+outbox           (id, aggregate_id, event_type, payload, created_at, published_at,
+                  claimed_until)   -- written by the settle statement itself (§4.3)
 ```
 
-`charges.status` is `pending | succeeded | declined | failed`, and `pending` is not an implementation detail: it is written **before** the provider is called (FR-4.5) and left in place when the call does not answer. A caller reading `pending` has an unknown outcome, not a failed one — the distinction the whole saga rests on. The `outbox` tables in both services arrive with the relay in P4; there is no publisher before then.
+`charges.status` is `pending | succeeded | declined | failed`, and `pending` is not an implementation detail: it is written **before** the provider is called (FR-4.5) and left in place when the call does not answer. A caller reading `pending` has an unknown outcome, not a failed one — the distinction the whole saga rests on. The `outbox` tables in both services arrived with the relay in P4 (§4.3).
 
 P2 prices a seat map at a flat per-seat rate (`seats.price_cents`), summed into `reservations.total_cents` under the same lock that claims the seats. `pricing_tiers` and `seats.tier_id` arrive with the organizer flow; nothing in the saga or in Payment changes when they do, because both already work from the stored total.
 
 ### notif_db
 ```
 notifications     (id, user_id, type, channel, status, payload, created_at)
+                  -- id IS the event_id: one event, one notification, and a
+                  -- redelivery resumes it and its attempt count (§4.5)
 delivery_attempts (id, notification_id, attempt_no, status, error, attempted_at)
-processed_events  (event_id PK, processed_at)   -- consumer idempotency
+                  UNIQUE (notification_id, attempt_no)
+processed_events  (event_id PK, processed_at)   -- consumer idempotency; written
+                  -- by the same statement that marks the notification sent
 ```
 
 ## 9. Internal service structure
@@ -490,6 +556,8 @@ That is the whole of admin management. There is no promotion endpoint and no adm
 As of P2 that is: `postgres` (booking_db), `auth_db`, `payment_db`, `booking`, `auth`, `payment`, `gateway`. There are no `depends_on` edges between the four services — each waits only on its own database, the gateway waits on nothing because it dials its upstreams lazily, and Booking does not wait on Payment for the same reason. Starting them in any order, or starting the gateway with every upstream down, is a supported configuration and is the compose-level expression of §3.3. Booking with Payment down serves seat maps and holds normally; only the pay step reports an unknown outcome, and reconciliation resolves those once Payment returns.
 
 `PAYMENT_PROVIDER_MODE` (`succeed` | `decline` | `hang`) selects how the mock provider answers. `hang` is the interesting one: it produces the unknown outcome D8 exists for, in a running stack, and lets an operator watch a hold's TTL get pushed out (`TTL seat:hold:...` in `redis-cli`) instead of lapsing, and the reconciliation job resolve it.
+
+P4 adds `rabbitmq`, `notif_db` and `notification`. Only Notification waits on the broker, which is its only source of work; Booking and Payment dial it lazily and keep serving with it down, their events waiting in the outbox. Nothing waits on Notification: stop it and bookings confirm exactly as before, while its durable queue fills and then drains when it returns. Its compose healthcheck is readiness — consuming — so `docker compose up --wait` does not return before its queue exists. RabbitMQ runs with a fixed hostname and a volume, because its data directory is keyed on the node name and a recreated container would otherwise abandon the durable queues and every message in them. `NOTIFICATION_MAIL_MODE=fail` is Notification's equivalent of `hang`: every email is refused, the attempts land in `delivery_attempts`, and the message moves to `notification.dlq`, visible in the management UI on port 15672.
 
 Each service has its own Dockerfile and its own CI pipeline. Independent deployability is the entire justification for this architecture — if services can only be released together, the split has bought nothing.
 

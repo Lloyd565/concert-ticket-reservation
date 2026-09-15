@@ -125,6 +125,7 @@ make migrate-down    # roll back last migration
 make test            # unit tests, all services
 make test-integration# integration tests (testcontainers; needs Docker)
 make test-concurrency# THE critical test — run before every commit touching booking
+make test-events     # outbox atomicity, relay confirms, a replayed event sends one email
 make lint            # golangci-lint, all services
 make load-test       # k6 concurrency scenario
 ```
@@ -198,9 +199,11 @@ Raise these with the human rather than deciding alone:
 | Calling Payment inside the claim transaction | Commit first, then call |
 | Treating a payment timeout as a failure | Leave `pending`; reconcile by idempotency key |
 | Publishing an event right after `COMMIT` | Write to outbox inside the transaction; relay publishes |
+| Holding outbox rows locked while publishing | Lease them in one statement, commit, then publish with nothing locked (D4) |
+| Enqueueing an event on a context with no transaction | Refused on purpose. Open `WithinTx` around the state change and its event |
 | Assuming exactly-once event delivery | Track processed `event_id`s |
 | Retrying a charge without an idempotency key | Always pass one |
-| Reintroducing a sweeper to expire holds | Redis TTL. The sweeper was retired in P3; a hold recorded in Postgres is a hold nothing expires without one |
+| Reintroducing a sweeper to expire holds | Redis TTL. The sweeper was retired in P3; a hold recorded in Postgres is a hold nothing expires without one. The P4 expirer moves a reservation's status and writes its event — never let it touch a seat, a key, or a reservation with `payment_pending_since` set |
 | Assuming a TTL respects `payment_pending_since` | It does not. Push the hold out with `Saga.KeepHold` (D8) |
 | Adding a "quick" cross-service DB read | Use gRPC or an event |
 | Hiding `FOR UPDATE` behind an ORM helper | Explicit SQL, always |
