@@ -57,6 +57,12 @@ type Mock struct {
 	// charge use case is only safe because of that property, so the mock has to
 	// have it too - otherwise the tests would pass against a mock that is more
 	// forgiving than the thing it stands in for.
+	//
+	// ponytail: in memory, so this record dies with the Payment process and a
+	// real provider's does not. In the running stack, a crash between approval
+	// and settle followed by a re-drive mints a second approval that nothing
+	// flags. Tests run in one process and are unaffected; persist it if the
+	// stack is ever used for crash testing.
 	mu      sync.Mutex
 	results map[string]domain.ProviderResult
 }

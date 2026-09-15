@@ -16,10 +16,24 @@ import (
 // Defaults for the provider call. All are overridable from config; these are
 // what a caller gets if it passes zero.
 const (
-	DefaultProviderTimeout = 3 * time.Second
+	// DefaultProviderTimeout is per attempt. Every attempt and the backoff
+	// between them must fit inside the caller's deadline, which gRPC carries in
+	// (Booking's is 3s): an attempt that uses the whole deadline leaves the retry
+	// nothing to run in.
+	DefaultProviderTimeout = time.Second
 	DefaultMaxAttempts     = 2
 	DefaultRetryBackoff    = 100 * time.Millisecond
 )
+
+// settleTimeout bounds the write that records a provider's answer.
+//
+// That write runs on a context detached from the caller's. Once the provider has
+// answered, money has moved or definitely has not, and Booking's deadline firing
+// a moment too early is no reason to forget which. Inheriting the cancellation
+// would leave the row pending with the answer lost - the same state a crash
+// leaves, recoverable only by re-driving the charge and trusting the provider to
+// replay it.
+const settleTimeout = 5 * time.Second
 
 // Charger takes money for a reservation.
 //
@@ -189,15 +203,20 @@ func (c *Charger) callProvider(ctx context.Context, ch domain.Charge) (domain.Ch
 	}
 	settled.UpdatedAt = time.Now().UTC()
 
+	// The provider has answered, so the answer is recorded even if the caller
+	// has stopped waiting for it (see settleTimeout).
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancelSettle()
+
 	// The UPDATE only touches rows that are still pending. If it changed
 	// nothing, another attempt under this key settled first; that result is
 	// authoritative and this one is a duplicate of it.
-	ok, err := c.charges.SettleCharge(ctx, settled)
+	ok, err := c.charges.SettleCharge(settleCtx, settled)
 	if err != nil {
 		return domain.Charge{}, err
 	}
 	if !ok {
-		winner, err := c.charges.FindChargeByIdempotencyKey(ctx, ch.IdempotencyKey)
+		winner, err := c.charges.FindChargeByIdempotencyKey(settleCtx, ch.IdempotencyKey)
 		if err != nil {
 			return domain.Charge{}, fmt.Errorf("reread settled charge %s: %w", ch.ID, err)
 		}

@@ -29,7 +29,10 @@ type Config struct {
 	// ProviderLatency simulates a provider that is slow but working.
 	ProviderLatency time.Duration
 	// ProviderTimeout bounds one provider call. Exceeding it produces an
-	// UNKNOWN outcome, never a failed one.
+	// UNKNOWN outcome, never a failed one. It is per attempt: ProviderMaxAttempts
+	// of them, plus backoff, must fit inside BOOKING_PAYMENT_TIMEOUT, which gRPC
+	// carries into every call. Otherwise the first attempt uses the caller's
+	// whole deadline and the retry never runs.
 	ProviderTimeout time.Duration
 	// ProviderMaxAttempts bounds retries (FR-4.4). Safe only because the
 	// idempotency key is passed through to the provider.
@@ -44,7 +47,7 @@ func Load() (Config, error) {
 		HTTPPort:            env("PAYMENT_HTTP_PORT", "8082"),
 		GRPCPort:            env("PAYMENT_GRPC_PORT", "9093"),
 		ProviderLatency:     0,
-		ProviderTimeout:     3 * time.Second,
+		ProviderTimeout:     time.Second,
 		ProviderMaxAttempts: 2,
 	}
 	if cfg.DatabaseURL == "" {

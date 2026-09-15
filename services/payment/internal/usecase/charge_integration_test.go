@@ -5,8 +5,10 @@ package usecase_test
 import (
 	"context"
 	"errors"
+	"log/slog"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/google/uuid"
 
@@ -191,6 +193,80 @@ func TestChargeResumesAnUnsettledCharge(t *testing.T) {
 	}
 	if n := countCharges(t, ctx, in.ReservationID); n != 1 {
 		t.Fatalf("recovery must resume the original charge, not create a second: got %d rows", n)
+	}
+}
+
+// TestChargeResumeReplaysAnApprovalItNeverRecorded is the crash FR-4.5 is for.
+// The provider approved - money moved - and Payment died before the UPDATE, so
+// the row says pending and carries no reference. Resuming must come back with
+// that approval, not a new one: a second reference is a second charge.
+//
+// TestChargeResumesAnUnsettledCharge cannot see this. Its first attempt hung, so
+// the provider had approved nothing, and a resume that reached the provider
+// under the wrong key would still pass it with one row and a fresh approval.
+func TestChargeResumeReplaysAnApprovalItNeverRecorded(t *testing.T) {
+	ctx := context.Background()
+	f := newFixture(t, provider.ModeHang)
+	in := newChargeInput()
+
+	// The pending row is written, and nothing settles it.
+	if _, err := f.charger.Charge(ctx, in); !errors.Is(err, domain.ErrProviderUnavailable) {
+		t.Fatalf("want ErrProviderUnavailable, got %v", err)
+	}
+	// The provider took the money under this key. Payment never heard.
+	f.provider.SetMode(provider.ModeSucceed)
+	approved, err := f.provider.Charge(ctx, in.IdempotencyKey, in.AmountCents)
+	if err != nil {
+		t.Fatalf("provider approval: %v", err)
+	}
+
+	ch, err := f.charger.Charge(ctx, in)
+	if err != nil {
+		t.Fatalf("resumed charge: %v", err)
+	}
+	if ch.ProviderRef != approved.Ref {
+		t.Fatalf("resume took the money a second time: the provider approved %s, the charge recorded %s", approved.Ref, ch.ProviderRef)
+	}
+	if _, ref := chargeRow(t, ctx, in.IdempotencyKey); ref == nil || *ref != approved.Ref {
+		t.Fatalf("database recorded reference %v, want the original approval %s", ref, approved.Ref)
+	}
+	if n := countCharges(t, ctx, in.ReservationID); n != 1 {
+		t.Fatalf("want 1 charge row, got %d", n)
+	}
+}
+
+// cancelAfterAnswer is a provider whose caller gives up the moment it answers:
+// Booking's deadline firing between the provider's approval and the write that
+// records it.
+type cancelAfterAnswer struct {
+	*provider.Mock
+	cancel context.CancelFunc
+}
+
+func (p cancelAfterAnswer) Charge(ctx context.Context, idempotencyKey string, amountCents int64) (domain.ProviderResult, error) {
+	res, err := p.Mock.Charge(ctx, idempotencyKey, amountCents)
+	p.cancel()
+	return res, err
+}
+
+// TestChargeRecordsAnAnswerItsCallerStoppedWaitingFor: money that moved is
+// recorded as moved, whether or not anyone is still waiting to hear it. Losing
+// it to the caller's cancellation would reproduce the crash above without a
+// crash, on any call that runs close to its deadline.
+func TestChargeRecordsAnAnswerItsCallerStoppedWaitingFor(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	f := newFixture(t, provider.ModeSucceed)
+	charger := usecase.NewCharger(f.repo, cancelAfterAnswer{Mock: f.provider, cancel: cancel}, 100*time.Millisecond, 1, slog.Default())
+	in := newChargeInput()
+
+	ch, err := charger.Charge(ctx, in)
+	if err != nil {
+		t.Fatalf("an approval the caller stopped waiting for was not recorded: %v", err)
+	}
+	status, ref := chargeRow(t, context.Background(), in.IdempotencyKey)
+	if status != string(domain.ChargeSucceeded) || ref == nil || *ref != ch.ProviderRef {
+		t.Fatalf("want the approval settled in the database, got status=%s ref=%v", status, ref)
 	}
 }
 

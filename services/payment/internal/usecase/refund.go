@@ -148,12 +148,17 @@ func (r *Refunder) callProvider(ctx context.Context, rf domain.Refund, chargeRef
 	}
 	settled.UpdatedAt = time.Now().UTC()
 
-	ok, err := r.refunds.SettleRefund(ctx, settled)
+	// Recorded even if the caller has stopped waiting, for the same reason as a
+	// charge (see settleTimeout).
+	settleCtx, cancelSettle := context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+	defer cancelSettle()
+
+	ok, err := r.refunds.SettleRefund(settleCtx, settled)
 	if err != nil {
 		return domain.Refund{}, err
 	}
 	if !ok {
-		winner, err := r.refunds.FindRefundByIdempotencyKey(ctx, rf.IdempotencyKey)
+		winner, err := r.refunds.FindRefundByIdempotencyKey(settleCtx, rf.IdempotencyKey)
 		if err != nil {
 			return domain.Refund{}, fmt.Errorf("reread settled refund %s: %w", rf.ID, err)
 		}
