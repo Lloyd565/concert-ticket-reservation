@@ -29,10 +29,11 @@ type Config struct {
 	JWTIssuer   string
 	JWTAudience string
 
-	// RateLimitRPS and RateLimitBurst are per client IP, per gateway replica.
+	// RateLimitRPS and RateLimitBurst apply to each client IP and, separately,
+	// to each authenticated user, per gateway replica.
 	RateLimitRPS   float64
 	RateLimitBurst int
-	// RateLimitIdle is how long an idle IP's bucket is kept before eviction.
+	// RateLimitIdle is how long an idle bucket is kept before eviction.
 	RateLimitIdle time.Duration
 }
 

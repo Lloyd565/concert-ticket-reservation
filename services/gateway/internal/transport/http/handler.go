@@ -76,10 +76,11 @@ func (h *Handler) Routes() http.Handler {
 	mux.HandleFunc("POST /v1/auth/logout", h.logout)
 
 	// Authenticated. Seeding an event is an organizer action; holding seats is
-	// open to any signed-in role.
-	mux.Handle("POST /v1/events", h.authn.Require(roleOrganizer, roleAdmin)(http.HandlerFunc(h.seedEvent)))
-	mux.Handle("POST /v1/reservations", h.authn.Require()(http.HandlerFunc(h.holdSeats)))
-	mux.Handle("POST /v1/reservations/{id}/pay", h.authn.Require()(http.HandlerFunc(h.payReservation)))
+	// open to any signed-in role. Each is also limited per user, which can only
+	// happen after authentication: that is where the user becomes known.
+	mux.Handle("POST /v1/events", h.authn.Require(roleOrganizer, roleAdmin)(h.limiter.PerUser(http.HandlerFunc(h.seedEvent))))
+	mux.Handle("POST /v1/reservations", h.authn.Require()(h.limiter.PerUser(http.HandlerFunc(h.holdSeats))))
+	mux.Handle("POST /v1/reservations/{id}/pay", h.authn.Require()(h.limiter.PerUser(http.HandlerFunc(h.payReservation))))
 
 	return middleware.Correlate(h.limiter.Middleware(mux))
 }

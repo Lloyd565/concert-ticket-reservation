@@ -418,6 +418,34 @@ func TestRateLimiting(t *testing.T) {
 	}
 }
 
+// TestRateLimitingPerUser: one account cannot escape its budget by spreading
+// requests across addresses (NFR-5.3), and another account is not charged for it.
+func TestRateLimitingPerUser(t *testing.T) {
+	gw := newGateway(t, &stubAuth{}, &stubBooking{}, 0.01, 3)
+	hold := func(bearer, addr string) int {
+		req := holdRequest(t, bearer)
+		req.RemoteAddr = addr
+		rec := httptest.NewRecorder()
+		gw.ServeHTTP(rec, req)
+		return rec.Code
+	}
+
+	// A fresh address for every request, so no per-IP bucket ever runs out.
+	for i := range 3 {
+		if code := hold(validToken(t), fmt.Sprintf("198.51.100.%d:1234", i+1)); code != http.StatusCreated {
+			t.Fatalf("request %d within the user's burst: status = %d, want 201", i+1, code)
+		}
+	}
+	if code := hold(validToken(t), "198.51.100.9:1234"); code != http.StatusTooManyRequests {
+		t.Fatalf("request past the user's burst from a fresh address: status = %d, want 429", code)
+	}
+
+	other := mint(t, func(c *jwt.RegisteredClaims) { c.Subject = "0192f3c4-5d6e-7f80-9123-000000000002" }, "attendee", testSecret, jwt.SigningMethodHS256)
+	if code := hold(other, "198.51.100.9:1234"); code != http.StatusCreated {
+		t.Fatalf("a different user from the same address: status = %d, want 201", code)
+	}
+}
+
 // TestUpstreamDownIsNotAnInternalError: Auth being unreachable is a 503 for the
 // routes that need it, and - crucially - is not an error for the routes that do
 // not (ARCHITECTURE.md §3.3).

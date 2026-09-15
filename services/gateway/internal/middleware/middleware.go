@@ -1,6 +1,7 @@
 // Package middleware holds the gateway's edge concerns: correlation IDs,
-// per-IP rate limiting and local access-token validation. These are the three
-// things that belong at the entrance and nowhere else (ARCHITECTURE.md §3.1).
+// per-IP and per-user rate limiting and local access-token validation. These
+// are the three things that belong at the entrance and nowhere else
+// (ARCHITECTURE.md §3.1).
 package middleware
 
 import (
@@ -79,7 +80,8 @@ func sanitizeCorrelationID(raw string) string {
 	return raw
 }
 
-// RateLimiter is a per-IP token bucket.
+// RateLimiter keeps a token bucket per client IP (Middleware) and per
+// authenticated user (PerUser).
 //
 // ponytail: in-process, so the limit is per gateway replica - two replicas
 // allow twice the rate. Move the buckets into Redis when the gateway is
@@ -143,12 +145,32 @@ func (l *RateLimiter) Middleware(next http.Handler) http.Handler {
 	})
 }
 
-func (l *RateLimiter) allow(ip string) bool {
+// PerUser rejects requests from an authenticated user who is over their budget
+// (NFR-5.3). It must sit behind Authenticator.Require, which is what puts the
+// user on the context.
+//
+// The per-IP limit cannot see an account: one user spread across many addresses
+// gets a fresh bucket at each, which is how a script hoards seats at on-sale.
+// Both limits apply to an authenticated request, and either can refuse it.
+func (l *RateLimiter) PerUser(next http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		claims, ok := ClaimsFrom(r.Context())
+		// The prefix keeps an account from ever sharing a bucket with an address.
+		if ok && !l.allow("user:"+claims.UserID) {
+			w.Header().Set("Retry-After", "1")
+			WriteError(w, http.StatusTooManyRequests, "rate_limited", "too many requests from this account")
+			return
+		}
+		next.ServeHTTP(w, r)
+	})
+}
+
+func (l *RateLimiter) allow(key string) bool {
 	l.mu.Lock()
-	v, ok := l.visitors[ip]
+	v, ok := l.visitors[key]
 	if !ok {
 		v = &visitor{limiter: rate.NewLimiter(l.limit, l.burst)}
-		l.visitors[ip] = v
+		l.visitors[key] = v
 	}
 	v.seen = time.Now()
 	l.mu.Unlock()
