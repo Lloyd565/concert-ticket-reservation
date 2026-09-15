@@ -22,8 +22,8 @@ import (
 //
 // Every saga path locks the reservation before the seats it owns. That ordering
 // is not incidental: it is what stops a confirm and a release for the same
-// reservation from deadlocking against each other, and it matches the order the
-// sweeper's single statement takes its locks in.
+// reservation from deadlocking against each other, and the confirm and refund
+// paths take their seat locks in the same order below.
 func (r *Repo) LockReservation(ctx context.Context, id string) (domain.Reservation, error) {
 	resID, err := uuid.Parse(id)
 	if err != nil {
@@ -93,7 +93,8 @@ func (r *Repo) SetReservationStatus(ctx context.Context, id string, from, to dom
 	return n == 1, nil
 }
 
-// MarkPaymentPending hands the reservation to the reconciliation job (D8).
+// MarkPaymentPending hands the reservation to the reconciliation job (D8),
+// reporting whether it was still pending - the fence in front of every charge.
 func (r *Repo) MarkPaymentPending(ctx context.Context, id string) (bool, error) {
 	resID, err := uuid.Parse(id)
 	if err != nil {
@@ -138,6 +139,62 @@ func (r *Repo) ListReservationsAwaitingReconciliation(ctx context.Context, older
 	return out, nil
 }
 
+// QueueChargeRecheck queues a reservation released on "no charge" evidence for
+// one more look at its charge key. Must run in the release's transaction.
+func (r *Repo) QueueChargeRecheck(ctx context.Context, reservationID string) error {
+	resID, err := uuid.Parse(reservationID)
+	if err != nil {
+		return fmt.Errorf("parse reservation id %q: %w", reservationID, domain.ErrInvalidInput)
+	}
+	if err := r.q(ctx).QueueChargeRecheck(ctx, resID); err != nil {
+		return fmt.Errorf("queue charge recheck: %w", err)
+	}
+	return nil
+}
+
+// ListReservationsAwaitingChargeRecheck returns queued reservations released
+// before olderThan.
+func (r *Repo) ListReservationsAwaitingChargeRecheck(ctx context.Context, olderThan time.Time, limit int) ([]domain.Reservation, error) {
+	rows, err := r.q(ctx).ListReservationsAwaitingChargeRecheck(ctx, ListReservationsAwaitingChargeRecheckParams{
+		OlderThan: olderThan,
+		RowLimit:  int32(limit), //nolint:gosec // limit is a small configured constant
+	})
+	if err != nil {
+		return nil, fmt.Errorf("list reservations awaiting charge recheck: %w", err)
+	}
+	out := make([]domain.Reservation, 0, len(rows))
+	for _, row := range rows {
+		res, err := r.withSeatIDs(ctx, domain.Reservation{
+			ID:                  row.ID.String(),
+			UserID:              row.UserID.String(),
+			EventID:             row.EventID.String(),
+			Status:              domain.ReservationStatus(row.Status),
+			TotalCents:          row.TotalCents,
+			ExpiresAt:           row.ExpiresAt,
+			IdempotencyKey:      row.IdempotencyKey,
+			CreatedAt:           row.CreatedAt,
+			PaymentPendingSince: row.PaymentPendingSince,
+		})
+		if err != nil {
+			return nil, err
+		}
+		out = append(out, res)
+	}
+	return out, nil
+}
+
+// ClearChargeRecheck removes a reservation from the recheck queue.
+func (r *Repo) ClearChargeRecheck(ctx context.Context, reservationID string) error {
+	resID, err := uuid.Parse(reservationID)
+	if err != nil {
+		return fmt.Errorf("parse reservation id %q: %w", reservationID, domain.ErrInvalidInput)
+	}
+	if err := r.q(ctx).ClearChargeRecheck(ctx, resID); err != nil {
+		return fmt.Errorf("clear charge recheck: %w", err)
+	}
+	return nil
+}
+
 // LockSeatsByReservation locks the seats a reservation actively claims, in
 // sorted seat-ID order (D5). Must be called inside a transaction.
 func (r *Repo) LockSeatsByReservation(ctx context.Context, reservationID string) ([]domain.Seat, error) {
@@ -152,33 +209,44 @@ func (r *Repo) LockSeatsByReservation(ctx context.Context, reservationID string)
 	seats := make([]domain.Seat, 0, len(rows))
 	for _, row := range rows {
 		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number,
-			row.Status, row.HeldByReservation, row.HeldUntil, row.PriceCents))
+			row.Status, row.PriceCents))
 	}
 	return seats, nil
 }
 
-// MarkSeatsBooked flips a reservation's held seats to booked.
+// MarkSeatsBooked flips a reservation's available seats to booked and stamps
+// its claims confirmed.
 func (r *Repo) MarkSeatsBooked(ctx context.Context, reservationID string) (int64, error) {
 	resID, err := uuid.Parse(reservationID)
 	if err != nil {
 		return 0, fmt.Errorf("parse reservation id %q: %w", reservationID, domain.ErrInvalidInput)
 	}
-	n, err := r.q(ctx).MarkSeatsBooked(ctx, &resID)
+	n, err := r.q(ctx).MarkSeatsBooked(ctx, resID)
+	if isUniqueViolation(err, "one_confirmed_claim_per_seat") {
+		// The D13 backstop fired: two reservations reached confirmation for the
+		// same seat. Reported as unavailable so the caller compensates - it
+		// wraps ErrSeatUnavailable, and the saga refunds a charge it cannot
+		// deliver - but reaching this line means both the Redis claim and the
+		// FOR UPDATE above it failed to serialise the two. Alert on it.
+		return 0, fmt.Errorf("book seats for reservation %s: %w", reservationID, domain.ErrBackstopTripped)
+	}
 	if err != nil {
 		return 0, fmt.Errorf("mark seats booked: %w", err)
 	}
 	return n, nil
 }
 
-// ReleaseHeldSeats returns a reservation's held seats to available.
-func (r *Repo) ReleaseHeldSeats(ctx context.Context, reservationID string) (int64, error) {
+// ReleaseClaims settles an unconfirmed reservation's claim rows. It touches no
+// seat: in P3 an unconfirmed claim never owned one - the Redis key did, and the
+// caller drops that separately.
+func (r *Repo) ReleaseClaims(ctx context.Context, reservationID string) (int64, error) {
 	resID, err := uuid.Parse(reservationID)
 	if err != nil {
 		return 0, fmt.Errorf("parse reservation id %q: %w", reservationID, domain.ErrInvalidInput)
 	}
-	n, err := r.q(ctx).ReleaseReservationSeats(ctx, resID)
+	n, err := r.q(ctx).ReleaseReservationClaims(ctx, resID)
 	if err != nil {
-		return 0, fmt.Errorf("release reservation seats: %w", err)
+		return 0, fmt.Errorf("release reservation claims: %w", err)
 	}
 	return n, nil
 }

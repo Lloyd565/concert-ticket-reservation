@@ -153,6 +153,13 @@ func (s *Server) fail(ctx context.Context, op string, err error) error {
 		// claim the locking path should already have prevented.
 		s.log.ErrorContext(ctx, "D13 backstop tripped - the seat locking path let a double claim through", "error", err)
 		return status.Error(codes.Aborted, "one or more seats are no longer available")
+	case errors.Is(err, domain.ErrHoldsUnavailable):
+		// Unavailable, not Aborted, and the difference matters: Aborted says the
+		// seat is gone, this says we cannot tell and will not guess (D12). It is
+		// also the one code here that is safe to retry, which is exactly the
+		// advice a caller should act on.
+		s.log.ErrorContext(ctx, "hold store unreachable; refusing holds rather than taking them unlocked", "op", op, "error", err)
+		return status.Error(codes.Unavailable, "seat holds are temporarily unavailable")
 	case errors.Is(err, domain.ErrSeatUnavailable):
 		// A lost race is an expected outcome, not a server fault (FR-3.2).
 		// Aborted is the gRPC code the gateway maps back to 409.

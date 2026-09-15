@@ -8,7 +8,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -72,40 +71,22 @@ func (r *Repo) q(ctx context.Context) *Queries {
 	return r.queries
 }
 
-// LockSeatsForUpdate locks the given seats with SELECT ... FOR UPDATE, ordered
-// by seat ID, and returns their current state. Must be called inside a
-// transaction; the lock is released when that transaction ends.
-func (r *Repo) LockSeatsForUpdate(ctx context.Context, eventID string, seatIDs []string) ([]domain.Seat, error) {
+// GetSeats returns the requested seats' catalog rows in seat-ID order. It takes
+// no locks: in P3 the lock is the Redis claim the caller has already won.
+func (r *Repo) GetSeats(ctx context.Context, eventID string, seatIDs []string) ([]domain.Seat, error) {
 	evID, ids, err := parseIDs(eventID, seatIDs)
 	if err != nil {
 		return nil, err
 	}
-	rows, err := r.q(ctx).LockSeatsForUpdate(ctx, LockSeatsForUpdateParams{EventID: evID, SeatIds: ids})
+	rows, err := r.q(ctx).GetSeatsForEvent(ctx, GetSeatsForEventParams{EventID: evID, SeatIds: ids})
 	if err != nil {
-		return nil, fmt.Errorf("lock seats for update: %w", err)
+		return nil, fmt.Errorf("get seats: %w", err)
 	}
 	seats := make([]domain.Seat, 0, len(rows))
 	for _, row := range rows {
-		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil, row.PriceCents))
+		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.PriceCents))
 	}
 	return seats, nil
-}
-
-// MarkSeatsHeld flips locked seats to held and returns the number updated.
-func (r *Repo) MarkSeatsHeld(ctx context.Context, seatIDs []string, reservationID string, until time.Time) (int64, error) {
-	resID, err := uuid.Parse(reservationID)
-	if err != nil {
-		return 0, fmt.Errorf("parse reservation id: %w", err)
-	}
-	ids, err := parseSeatIDs(seatIDs)
-	if err != nil {
-		return 0, err
-	}
-	n, err := r.q(ctx).MarkSeatsHeld(ctx, MarkSeatsHeldParams{ReservationID: &resID, HeldUntil: &until, SeatIds: ids})
-	if err != nil {
-		return 0, fmt.Errorf("mark seats held: %w", err)
-	}
-	return n, nil
 }
 
 // ListSeatsByEvent returns the full seat map for an event.
@@ -120,7 +101,7 @@ func (r *Repo) ListSeatsByEvent(ctx context.Context, eventID string) ([]domain.S
 	}
 	seats := make([]domain.Seat, 0, len(rows))
 	for _, row := range rows {
-		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.HeldByReservation, row.HeldUntil, row.PriceCents))
+		seats = append(seats, toSeat(row.ID, row.EventID, row.Section, row.Row, row.Number, row.Status, row.PriceCents))
 	}
 	return seats, nil
 }
@@ -173,13 +154,6 @@ func (r *Repo) AttachSeats(ctx context.Context, reservationID string, seatIDs []
 		return err
 	}
 	err = r.q(ctx).AttachSeatsToReservation(ctx, AttachSeatsToReservationParams{ReservationID: resID, SeatIds: ids})
-	if isUniqueViolation(err, "one_active_claim_per_seat") {
-		// The D13 backstop fired: the application believed these seats were
-		// free while another live claim existed. Reported as unavailable so the
-		// client still gets a correct 409 - but reaching this line means the
-		// locking path above it has a bug.
-		return fmt.Errorf("attach seats to reservation %s: %w", reservationID, domain.ErrBackstopTripped)
-	}
 	if err != nil {
 		return fmt.Errorf("attach seats to reservation: %w", err)
 	}
@@ -217,16 +191,6 @@ func (r *Repo) FindReservationByIdempotencyKey(ctx context.Context, key string) 
 	return res, nil
 }
 
-// ReleaseExpiredHolds returns seats whose checkout window closed to available
-// and marks their reservations expired. Returns the number of seats freed.
-func (r *Repo) ReleaseExpiredHolds(ctx context.Context) (int64, error) {
-	n, err := r.q(ctx).ReleaseExpiredHolds(ctx)
-	if err != nil {
-		return 0, fmt.Errorf("release expired holds: %w", err)
-	}
-	return n, nil
-}
-
 // CreateEvent inserts an event.
 func (r *Repo) CreateEvent(ctx context.Context, ev domain.Event) error {
 	id, err := uuid.Parse(ev.ID)
@@ -259,21 +223,16 @@ func (r *Repo) CreateSeats(ctx context.Context, seats []domain.Seat) error {
 	return nil
 }
 
-func toSeat(id, eventID uuid.UUID, section, row, number, status string, heldBy *uuid.UUID, heldUntil *time.Time, priceCents int64) domain.Seat {
-	s := domain.Seat{
+func toSeat(id, eventID uuid.UUID, section, row, number, status string, priceCents int64) domain.Seat {
+	return domain.Seat{
 		ID:         id.String(),
 		EventID:    eventID.String(),
 		Section:    section,
 		Row:        row,
 		Number:     number,
 		Status:     domain.SeatStatus(status),
-		HeldUntil:  heldUntil,
 		PriceCents: priceCents,
 	}
-	if heldBy != nil {
-		s.HeldBy = heldBy.String()
-	}
-	return s
 }
 
 func parseIDs(eventID string, seatIDs []string) (uuid.UUID, []uuid.UUID, error) {

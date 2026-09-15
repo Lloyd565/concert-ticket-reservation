@@ -2,9 +2,11 @@
 
 // Integration tests for the Booking service's use cases.
 //
-// These run against a real PostgreSQL container, never a mock. A mock cannot
-// exhibit a race condition, so a mocked version of the concurrency test below
-// would prove nothing at all (AGENTS.md §7).
+// These run against a real PostgreSQL container and a real Redis container,
+// never a mock. A mock cannot exhibit a race condition, so a mocked version of
+// the concurrency test would prove nothing at all (AGENTS.md §7). In P3 that
+// applies to Redis first of all: Redis is the lock now, and a fake one would be
+// a fake proof.
 package usecase_test
 
 import (
@@ -19,18 +21,25 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
+	goredis "github.com/redis/go-redis/v9"
 	"github.com/testcontainers/testcontainers-go"
 	tcpostgres "github.com/testcontainers/testcontainers-go/modules/postgres"
 	"github.com/testcontainers/testcontainers-go/wait"
 
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/domain"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/postgres"
+	bookingredis "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/redis"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/usecase"
 )
 
-// testPool is shared by every test in this package: one container per package
-// run, not one per test.
-var testPool *pgxpool.Pool
+// The shared infrastructure: one Postgres container and one Redis container per
+// package run, not one per test. testPool is for assertions only - the code
+// under test reaches the database through per-replica pools (see newReplicas).
+var (
+	testPool      *pgxpool.Pool
+	testDSN       string
+	testRedisAddr string
+)
 
 func TestMain(m *testing.M) {
 	ctx := context.Background()
@@ -50,22 +59,28 @@ func TestMain(m *testing.M) {
 	}
 	defer func() { _ = testcontainers.TerminateContainer(container) }()
 
-	dsn, err := container.ConnectionString(ctx, "sslmode=disable")
+	testDSN, err = container.ConnectionString(ctx, "sslmode=disable")
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "connection string: %v\n", err)
 		os.Exit(1)
 	}
 
-	cfg, err := pgxpool.ParseConfig(dsn)
+	redisContainer, redisAddr, err := startRedis(ctx)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "start redis container: %v\n", err)
+		os.Exit(1)
+	}
+	testRedisAddr = redisAddr
+	defer func() { _ = testcontainers.TerminateContainer(redisContainer) }()
+
+	cfg, err := pgxpool.ParseConfig(testDSN)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "parse dsn: %v\n", err)
 		os.Exit(1)
 	}
-	// Enough connections that the concurrency test contends on the seat row
-	// rather than on the pool - the pool queue would serialise callers before
-	// they ever reached SELECT ... FOR UPDATE and the test would pass for the
-	// wrong reason.
-	cfg.MaxConns = 32
+	// Small on purpose: this pool only runs the SQL that tests assert with. The
+	// connections that matter belong to the replicas.
+	cfg.MaxConns = 8
 
 	testPool, err = pgxpool.NewWithConfig(ctx, cfg)
 	if err != nil {
@@ -80,7 +95,36 @@ func TestMain(m *testing.M) {
 	code := m.Run()
 	testPool.Close()
 	_ = testcontainers.TerminateContainer(container)
+	_ = testcontainers.TerminateContainer(redisContainer)
 	os.Exit(code)
+}
+
+// startRedis brings up a Redis container and returns it with its host address.
+//
+// Returned rather than hidden, because one test needs to kill it: proving that
+// losing Redis fails holds closed (D12) means actually losing Redis, not
+// pointing a client at a port nobody is listening on.
+func startRedis(ctx context.Context) (testcontainers.Container, string, error) {
+	c, err := testcontainers.GenericContainer(ctx, testcontainers.GenericContainerRequest{
+		ContainerRequest: testcontainers.ContainerRequest{
+			Image:        "redis:7-alpine",
+			ExposedPorts: []string{"6379/tcp"},
+			WaitingFor:   wait.ForLog("Ready to accept connections").WithStartupTimeout(2 * time.Minute),
+		},
+		Started: true,
+	})
+	if err != nil {
+		return nil, "", err
+	}
+	host, err := c.Host(ctx)
+	if err != nil {
+		return c, "", err
+	}
+	port, err := c.MappedPort(ctx, "6379/tcp")
+	if err != nil {
+		return c, "", err
+	}
+	return c, fmt.Sprintf("%s:%s", host, port.Port()), nil
 }
 
 // applyMigrations runs the checked-in .up.sql files against the test database.
@@ -106,19 +150,25 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 	return nil
 }
 
-// fixture is the wiring one test needs. Each test seeds its own event, so tests
-// never contend with each other over the same seats.
+// fixture is one Booking replica's worth of wiring.
 //
-// Postgres is real in every test here. Payment is not: it is the fake below,
-// because the failure the saga most needs to survive - a payment call that
-// never answers - is one no real service will produce on demand. That is the
-// division AGENTS.md §7 draws. Never mock the database in a test that validates
-// locking; do inject faults into the dependency whose faults are the subject.
+// "Replica" is meant literally. Each one gets its own connection pool and its
+// own Redis client, and two of them share nothing in this process: no mutex, no
+// map, no channel. Everything they agree about, they agree about through
+// Postgres and Redis - which is exactly the relationship two containers have.
+// That is what makes the multi-replica concurrency test worth running.
+//
+// Postgres and Redis are real in every test here. Payment is not: it is the
+// fake below, because the failure the saga most needs to survive - a payment
+// call that never answers - is one no real service will produce on demand. That
+// is the division AGENTS.md §7 draws. Never mock the store whose concurrency is
+// the subject; do inject faults into the dependency whose faults are.
 type fixture struct {
 	repo       *postgres.Repo
+	holds      *bookingredis.Holds
+	redis      *goredis.Client
 	holder     *usecase.Holder
 	seeder     *usecase.Seeder
-	sweeper    *usecase.Sweeper
 	saga       *usecase.Saga
 	reconciler *usecase.Reconciler
 	payment    *fakePayment
@@ -126,17 +176,56 @@ type fixture struct {
 
 func newFixture(t *testing.T, holdTTL time.Duration) *fixture {
 	t.Helper()
-	repo := postgres.NewRepo(testPool)
-	txm := postgres.NewTxManager(testPool)
-	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelWarn}))
+	return newReplicas(t, 1, holdTTL)[0]
+}
+
+// newReplicas wires n independent replicas against the shared Postgres and
+// Redis.
+func newReplicas(t *testing.T, n int, holdTTL time.Duration) []*fixture {
+	t.Helper()
+	out := make([]*fixture, 0, n)
+	for i := 0; i < n; i++ {
+		out = append(out, newReplicaAt(t, holdTTL, testRedisAddr))
+	}
+	return out
+}
+
+// newReplicaAt wires one replica against a named Redis, so a test can stand a
+// replica up in front of a Redis it is about to kill.
+func newReplicaAt(t *testing.T, holdTTL time.Duration, redisAddr string) *fixture {
+	t.Helper()
+
+	cfg, err := pgxpool.ParseConfig(testDSN)
+	if err != nil {
+		t.Fatalf("parse dsn: %v", err)
+	}
+	// Enough connections that the concurrency test contends on seat state
+	// rather than on the pool - a pool queue would serialise callers before
+	// they reached the claim and the test would pass for the wrong reason.
+	cfg.MaxConns = 24
+	pool, err := pgxpool.NewWithConfig(context.Background(), cfg)
+	if err != nil {
+		t.Fatalf("connect replica pool: %v", err)
+	}
+	t.Cleanup(pool.Close)
+
+	rdb := goredis.NewClient(&goredis.Options{Addr: redisAddr})
+	t.Cleanup(func() { _ = rdb.Close() })
+	holds := bookingredis.NewHolds(rdb)
+
+	repo := postgres.NewRepo(pool)
+	txm := postgres.NewTxManager(pool)
+	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	payment := newFakePayment()
-	saga := usecase.NewSaga(txm, repo, repo, repo, payment, log)
+	saga := usecase.NewSaga(txm, holds, repo, repo, repo, payment, holdTTL, log)
+
 	return &fixture{
-		repo:    repo,
-		holder:  usecase.NewHolder(txm, repo, repo, holdTTL),
-		seeder:  usecase.NewSeeder(txm, repo),
-		sweeper: usecase.NewSweeper(repo, time.Second, log),
-		saga:    saga,
+		repo:   repo,
+		holds:  holds,
+		redis:  rdb,
+		holder: usecase.NewHolder(txm, holds, repo, repo, holdTTL, log),
+		seeder: usecase.NewSeeder(txm, repo),
+		saga:   saga,
 		// A long grace period, which is also what isolates these tests from
 		// each other: the reconciliation scan is global, so a test opts its own
 		// reservation in by backdating payment_pending_since (see
@@ -144,6 +233,23 @@ func newFixture(t *testing.T, holdTTL time.Duration) *fixture {
 		reconciler: usecase.NewReconciler(saga, repo, payment, time.Second, time.Hour, 0, log),
 		payment:    payment,
 	}
+}
+
+// holdKey is the key layout under test, spelled out here rather than imported
+// so that a change to it has to be made deliberately in two places.
+func holdKey(eventID, seatID string) string { return "seat:hold:" + eventID + ":" + seatID }
+
+// holder returns the reservation currently holding a seat, or "" if none is.
+func holder(t *testing.T, ctx context.Context, f *fixture, eventID, seatID string) string {
+	t.Helper()
+	v, err := f.redis.Get(ctx, holdKey(eventID, seatID)).Result()
+	if err == goredis.Nil {
+		return ""
+	}
+	if err != nil {
+		t.Fatalf("read hold key: %v", err)
+	}
+	return v
 }
 
 // paymentMode is how the fake Payment service answers.
@@ -182,6 +288,10 @@ type fakePayment struct {
 	charges     map[string]domain.PaymentResult
 	refunds     map[string]int64
 	chargeCalls int
+	// onCharge, when set, runs at the start of every Charge call: a view of what
+	// Booking has already committed while its call is in flight, which is all a
+	// Booking that crashes mid-call leaves behind.
+	onCharge func()
 }
 
 func newFakePayment() *fakePayment {
@@ -208,6 +318,9 @@ func (f *fakePayment) Charge(ctx context.Context, req usecase.ChargeRequest) (do
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	f.chargeCalls++
+	if f.onCharge != nil {
+		f.onCharge()
+	}
 
 	// Idempotent by key, exactly like the real service: a replay returns the
 	// original settled answer rather than charging again.

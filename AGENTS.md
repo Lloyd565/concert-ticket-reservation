@@ -192,13 +192,15 @@ Raise these with the human rather than deciding alone:
 
 | Trap | Correct approach |
 |---|---|
-| Check availability, then update in separate statements | `SELECT ... FOR UPDATE` then update, in one transaction |
+| Check availability, then update in separate statements | Claim with `SET NX` (the taking *is* the check); at confirmation, `SELECT ... FOR UPDATE` then update, in one transaction |
+| Multi-seat claims as separate Redis round trips | One Lua script: partial holds and cross-caller `DEL`s live in the gaps between round trips (ARCHITECTURE.md §5.2.1) |
 | Locking seats in request order | Sort by seat ID first |
 | Calling Payment inside the claim transaction | Commit first, then call |
 | Treating a payment timeout as a failure | Leave `pending`; reconcile by idempotency key |
 | Publishing an event right after `COMMIT` | Write to outbox inside the transaction; relay publishes |
 | Assuming exactly-once event delivery | Track processed `event_id`s |
 | Retrying a charge without an idempotency key | Always pass one |
-| Cron sweeper as the only expiry mechanism in P3+ | Redis TTL; sweeper is a P0 mechanism and a P3 backstop |
+| Reintroducing a sweeper to expire holds | Redis TTL. The sweeper was retired in P3; a hold recorded in Postgres is a hold nothing expires without one |
+| Assuming a TTL respects `payment_pending_since` | It does not. Push the hold out with `Saga.KeepHold` (D8) |
 | Adding a "quick" cross-service DB read | Use gRPC or an event |
 | Hiding `FOR UPDATE` behind an ORM helper | Explicit SQL, always |

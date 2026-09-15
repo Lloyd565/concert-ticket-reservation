@@ -3,6 +3,7 @@ package usecase
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
 	"time"
 
@@ -12,8 +13,8 @@ import (
 // Defaults for the reconciliation job.
 const (
 	// DefaultReconcileInterval is how often the job sweeps. It must be well
-	// under the hold TTL: these reservations are the ones the sweeper is
-	// forbidden to touch, so nothing else will ever free their seats.
+	// under the hold TTL: this job owns these reservations, and every pass is
+	// also what keeps their holds from lapsing (see KeepHold).
 	DefaultReconcileInterval = 15 * time.Second
 	// DefaultReconcileGrace is how long a payment outcome may stay unknown
 	// before the job intervenes. Long enough that a slow-but-succeeding call
@@ -101,16 +102,96 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (int, error) {
 			// One reservation failing must not abandon the rest of the batch:
 			// the common reason is that Payment is still unreachable, which is
 			// true for all of them and self-correcting for none of them.
+			//
+			// Unresolved means still owned by this job, and in P3 owning a
+			// reservation means keeping its Redis hold alive. Skipping this
+			// would let the seats of a possibly-paid customer go back on sale
+			// during exactly the outage that makes resolving impossible - D8
+			// violated by a TTL quietly doing its job (§6.2 row 2).
+			r.saga.KeepHold(ctx, res.ID)
 			r.log.WarnContext(ctx, "could not resolve reservation; will retry",
 				"reservation_id", res.ID, "unknown_since", res.PaymentPendingSince, "error", err)
 			continue
 		}
 		resolved++
 	}
+	rechecked, err := r.recheckReleased(ctx)
+	if err != nil {
+		return resolved, err
+	}
+	resolved += rechecked
 	if resolved > 0 {
 		r.log.InfoContext(ctx, "reconciliation resolved reservations", "resolved", resolved, "examined", len(stuck))
 	}
 	return resolved, nil
+}
+
+// recheckReleased asks Payment once more about every reservation released on
+// "no charge" evidence longer than the grace period ago.
+//
+// That evidence is a snapshot. A pay retry already past Pay's fence when the
+// release committed can reach Payment after it, and take the money for a
+// reservation that is now failed with its seats back on sale - which the
+// pending-only scan above never sees again. The fence means no charge starts
+// after a release, and one that started before it reaches Payment within one
+// BOOKING_PAYMENT_TIMEOUT, which the grace period is required to exceed. So a
+// single look after the grace period is final:
+//
+//	succeeded                     -> refund; the seats are gone, nothing to deliver
+//	pending                       -> re-drive under the same key, then act on the result
+//	declined / failed / no charge -> no money moved; done
+func (r *Reconciler) recheckReleased(ctx context.Context) (int, error) {
+	released, err := r.reservations.ListReservationsAwaitingChargeRecheck(ctx, time.Now().UTC().Add(-r.grace), r.batch)
+	if err != nil {
+		return 0, err
+	}
+	done := 0
+	for _, res := range released {
+		if err := r.recheck(ctx, res); err != nil {
+			// Still queued, so the next pass looks again. There is no hold to
+			// keep alive: these seats were released on purpose.
+			r.log.WarnContext(ctx, "could not recheck a released reservation's charge; will retry",
+				"reservation_id", res.ID, "error", err)
+			continue
+		}
+		done++
+	}
+	return done, nil
+}
+
+func (r *Reconciler) recheck(ctx context.Context, res domain.Reservation) error {
+	result, err := r.payments.GetCharge(ctx, ChargeIdempotencyKey(res.ID))
+	if err != nil {
+		return err
+	}
+	if result.Status == domain.PaymentPending {
+		// The charge row exists, so this resumes it; it cannot start a new one.
+		result, err = r.payments.Charge(ctx, ChargeRequest{
+			ReservationID:  res.ID,
+			UserID:         res.UserID,
+			AmountCents:    res.TotalCents,
+			IdempotencyKey: ChargeIdempotencyKey(res.ID),
+		})
+		if err != nil {
+			return err
+		}
+	}
+
+	switch result.Status {
+	case domain.PaymentSucceeded:
+		r.log.WarnContext(ctx, "a charge landed after its reservation was released; refunding",
+			"reservation_id", res.ID, "charge_id", result.ChargeID)
+		// Refunded before the entry is cleared, and under a key derived from the
+		// reservation: a crash in between refunds again, idempotently.
+		if err := r.saga.RefundUnconfirmable(ctx, res, result); err != nil {
+			return err
+		}
+	case domain.PaymentDeclined, domain.PaymentFailed, domain.PaymentNoCharge:
+		// No money moved, and none can move under this key any more.
+	default:
+		return fmt.Errorf("charge for released reservation %s is still %s", res.ID, result.Status)
+	}
+	return r.reservations.ClearChargeRecheck(ctx, res.ID)
 }
 
 // resolve asks Payment what happened and applies the one action that answer
@@ -118,10 +199,11 @@ func (r *Reconciler) ReconcileOnce(ctx context.Context) (int, error) {
 func (r *Reconciler) resolve(ctx context.Context, res domain.Reservation) error {
 	result, err := r.payments.GetCharge(ctx, ChargeIdempotencyKey(res.ID))
 	if err != nil {
-		// Still cannot ask. The reservation keeps its seats and its mark; the
-		// next pass tries again. This is the loop converging slowly, not
-		// failing - and slow convergence is the price D8 charges for never
-		// releasing a seat somebody may have paid for.
+		// Still cannot ask. The reservation keeps its seats, its mark and (via
+		// the caller's KeepHold) its Redis claims; the next pass tries again.
+		// This is the loop converging slowly, not failing - and slow
+		// convergence is the price D8 charges for never releasing a seat
+		// somebody may have paid for.
 		return err
 	}
 

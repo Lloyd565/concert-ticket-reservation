@@ -25,7 +25,7 @@ import (
 //
 //	§6.2 row 1  payment declined                    -> ReleaseDeclined
 //	§6.2 row 2  payment call timed out (unknown)    -> LeavePendingForReconciliation
-//	§6.2 row 3  hold expired before payment         -> Sweeper (P0, sweeper.go)
+//	§6.2 row 3  hold expired before payment         -> the Redis TTL, unaided
 //	§6.2 row 4  paid but confirmation impossible    -> RefundUnconfirmable
 //	§6.2 row 5  refund on a confirmed booking       -> ReleaseRefunded
 //
@@ -35,16 +35,23 @@ import (
 // Saga orchestrates reservation -> payment -> confirmation.
 type Saga struct {
 	tx           TxManager
+	holds        HoldStore
 	seats        SeatRepository
 	reservations ReservationRepository
 	bookings     BookingRepository
 	payments     PaymentClient
-	log          *slog.Logger
+	// holdTTL is the checkout window, needed here because D8 has to push a
+	// hold out past it - see KeepHold.
+	holdTTL time.Duration
+	log     *slog.Logger
 }
 
 // NewSaga wires a Saga.
-func NewSaga(tx TxManager, seats SeatRepository, reservations ReservationRepository, bookings BookingRepository, payments PaymentClient, log *slog.Logger) *Saga {
-	return &Saga{tx: tx, seats: seats, reservations: reservations, bookings: bookings, payments: payments, log: log}
+func NewSaga(tx TxManager, holds HoldStore, seats SeatRepository, reservations ReservationRepository, bookings BookingRepository, payments PaymentClient, holdTTL time.Duration, log *slog.Logger) *Saga {
+	if holdTTL <= 0 {
+		holdTTL = DefaultHoldTTL
+	}
+	return &Saga{tx: tx, holds: holds, seats: seats, reservations: reservations, bookings: bookings, payments: payments, holdTTL: holdTTL, log: log}
 }
 
 // Confirmation is a completed purchase.
@@ -108,7 +115,7 @@ func (s *Saga) Pay(ctx context.Context, reservationID, userID, idempotencyKey st
 	case res.Status != domain.ReservationPending:
 		return Confirmation{}, fmt.Errorf("reservation %s is %s: %w", reservationID, res.Status, domain.ErrReservationNotPayable)
 	case res.Expired(time.Now().UTC()):
-		// FR-4.2. The window closed; the sweeper has released these seats or is
+		// FR-4.2. The window closed, so the Redis keys have expired or are
 		// about to, and charging for seats somebody else can now buy is how a
 		// paid-but-unbooked customer is created.
 		return Confirmation{}, fmt.Errorf("reservation %s expired at %s: %w", reservationID, res.ExpiresAt.Format(time.RFC3339), domain.ErrReservationNotPayable)
@@ -118,11 +125,37 @@ func (s *Saga) Pay(ctx context.Context, reservationID, userID, idempotencyKey st
 	// charge key is derived from the reservation, so this call resumes the
 	// existing charge rather than creating a second one, and Payment answers
 	// from its own record if it already has one. Racing the reconciliation job
-	// is harmless for the same reason - both paths end at the same idempotent
-	// confirm.
+	// is safe too: two confirms meet at the same idempotent confirm, and a
+	// release that beats this call is caught either by the fence below or, if
+	// this call was already past it, by the recheck that release queues.
 	if res.PaymentOutcomeUnknown() {
 		s.log.InfoContext(ctx, "retrying a payment whose outcome is unknown",
 			"reservation_id", res.ID, "unknown_since", res.PaymentPendingSince)
+	}
+
+	// Hand the reservation to reconciliation BEFORE the call, for the reason
+	// Payment writes its charge row before calling the provider (FR-4.5).
+	//
+	// Marking only once the call has failed assumes this process lives through
+	// the call. If Booking dies mid-call nothing afterwards runs: the reservation
+	// is never marked, reconciliation never scans it, and once its window closes
+	// Pay refuses the customer's retry - so a charge that went through is never
+	// delivered and never refunded. Marked first, a crash anywhere past this line
+	// leaves a reservation the job will find.
+	//
+	// A mark that cannot be written stops the call: a charge nothing will ever
+	// look for is a charge that must not be started.
+	pending, err := s.reservations.MarkPaymentPending(ctx, res.ID)
+	if err != nil {
+		return Confirmation{}, err
+	}
+	if !pending {
+		// Settled since the status check above: confirmed by another pass, or
+		// released by reconciliation. This is the fence that makes a release
+		// safe to recheck. No charge can start once a release has committed, so
+		// any charge a release missed was already under way, and it reaches
+		// Payment within one call's deadline (see Reconciler.recheckReleased).
+		return Confirmation{}, fmt.Errorf("reservation %s settled before its charge could start: %w", res.ID, domain.ErrReservationNotPayable)
 	}
 
 	result, err := s.payments.Charge(ctx, ChargeRequest{
@@ -142,9 +175,10 @@ func (s *Saga) Pay(ctx context.Context, reservationID, userID, idempotencyKey st
 	// already been cancelled - the gateway's deadline fired, or the customer
 	// closed the tab - which is exactly the moment a charge is most likely to
 	// be in flight. Inheriting that cancellation means the reservation is left
-	// pending with nothing marking it for reconciliation, and the sweeper
-	// releases seats that may already have been paid for: D8 violated by way of
-	// a context, with no code path anywhere that looks wrong.
+	// pending with nothing marking it for reconciliation and its hold never
+	// extended, and the TTL releases seats that may already have been paid for:
+	// D8 violated by way of a context, with no code path anywhere that looks
+	// wrong.
 	//
 	// WithoutCancel keeps the values - the correlation ID still travels - and
 	// drops only the cancellation.
@@ -156,9 +190,11 @@ func (s *Saga) Pay(ctx context.Context, reservationID, userID, idempotencyKey st
 			// §6.2 row 2. Nothing is released here. Nothing.
 			return Confirmation{}, s.LeavePendingForReconciliation(opCtx, res.ID, err)
 		}
-		// A definite rejection of the request itself: nothing was charged, and
-		// the seats stay held for the rest of the checkout window so the
-		// customer can retry. The sweeper collects them if they do not.
+		// A definite rejection of the request itself: nothing was charged. The
+		// seats stay held and the reservation keeps the mark written above, so
+		// once the grace period passes reconciliation asks Payment, hears there
+		// is no charge, and releases them. Holding out longer for a retry would
+		// buy nothing: a malformed request is refused every time.
 		return Confirmation{}, err
 	}
 
@@ -171,7 +207,23 @@ func (s *Saga) Pay(ctx context.Context, reservationID, userID, idempotencyKey st
 func (s *Saga) dispatch(ctx context.Context, res domain.Reservation, result domain.PaymentResult) (Confirmation, error) {
 	switch result.Status {
 	case domain.PaymentSucceeded:
-		return s.ConfirmPaid(ctx, res.ID, result)
+		conf, err := s.ConfirmPaid(ctx, res.ID, result)
+		if err != nil {
+			// The money moved and this reservation did not become a booking -
+			// whether because it can never be one, or because the database or
+			// Redis was unreachable for the twenty milliseconds it took to try.
+			// Either way there is now a charge with no delivery, and the only
+			// component that resolves that is reconciliation, so hand it over
+			// rather than returning an error nobody follows up (FR-5.3).
+			// It asks Payment, gets 'succeeded', retries the confirm, and
+			// refunds if confirmation is genuinely impossible (§6.2 row 4).
+			if markErr := s.LeavePendingForReconciliation(ctx, res.ID, err); markErr != nil &&
+				!errors.Is(markErr, domain.ErrPaymentOutcomeUnknown) {
+				s.log.ErrorContext(ctx, "paid reservation could not be confirmed or marked for reconciliation",
+					"reservation_id", res.ID, "confirm_error", err, "mark_error", markErr)
+			}
+		}
+		return conf, err
 
 	case domain.PaymentDeclined, domain.PaymentFailed:
 		// §6.2 row 1.
@@ -210,9 +262,36 @@ func (s *Saga) dispatch(ctx context.Context, res domain.Reservation, result doma
 // customer has paid for something that cannot be delivered, and the only correct
 // answer is RefundUnconfirmable.
 func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge domain.PaymentResult) (Confirmation, error) {
+	// Asked before the transaction opens, because it is a network call and a
+	// transaction may not span one (D4).
+	//
+	// This is P3's replacement for "the sweeper already released these seats".
+	// In P0 an expired hold left no claim to lock and confirmation failed on
+	// that; a Redis key expires leaving nothing behind, so the question has to
+	// be put directly: do we still hold what we are about to sell? Answering it
+	// means the customer whose payment took too long gets refunded, instead of
+	// being charged for a seat somebody else is holding right now.
+	//
+	// It is not the safety check. The safety check is the row lock below: if
+	// this answer goes stale between here and there, Postgres still lets exactly
+	// one reservation book the seat.
+	current, err := s.reservations.GetReservation(ctx, reservationID)
+	if err != nil {
+		return Confirmation{}, err
+	}
+	if current.Status == domain.ReservationPending {
+		owns, err := s.holds.Owns(ctx, current.EventID, current.SeatIDs, current.ID)
+		if err != nil {
+			return Confirmation{}, err
+		}
+		if !owns {
+			return Confirmation{}, fmt.Errorf("reservation %s no longer holds its seats: %w", current.ID, domain.ErrConfirmUnrecoverable)
+		}
+	}
+
 	var out Confirmation
 
-	err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
+	err = s.tx.WithinTx(ctx, func(ctx context.Context) error {
 		// Lock the reservation first, everywhere, before the seats it owns.
 		// Consistent ordering across the confirm, release and expiry paths is
 		// what stops them forming a waiting cycle (D5 applied above seat level).
@@ -222,9 +301,9 @@ func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge dom
 		}
 
 		// Re-read under the lock, because the status this caller remembered
-		// from before the payment call is stale by definition. In between, the
-		// sweeper may have expired this reservation, or another pass may have
-		// confirmed it.
+		// from before the payment call is stale by definition. In between, a
+		// compensation may have failed this reservation, or another pass may
+		// have confirmed it.
 		if res.Status == domain.ReservationConfirmed {
 			booking, err := s.bookings.GetBookingByReservation(ctx, reservationID)
 			if err != nil {
@@ -246,14 +325,16 @@ func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge dom
 			return err
 		}
 		if len(seats) == 0 {
-			// The claims were released - the sweeper got here first, or a
-			// compensation did. The seats may already belong to somebody else.
+			// The claims were released by a compensation. The seats may already
+			// belong to somebody else.
 			return fmt.Errorf("reservation %s holds no seats: %w", res.ID, domain.ErrConfirmUnrecoverable)
 		}
 		// Run the transition through the domain state machine rather than
 		// trusting the UPDATE: the rule about which states may become booked
 		// lives in one place (AGENTS.md §4), and an illegal transition is a
-		// typed error here instead of a silently unaffected row.
+		// typed error here instead of a silently unaffected row. A seat that is
+		// already booked fails here, which is the case where another
+		// reservation's confirmation beat this one to it.
 		for i := range seats {
 			if err := seats[i].Confirm(); err != nil {
 				return fmt.Errorf("confirm seat %s (%v): %w", seats[i].ID, err, domain.ErrConfirmUnrecoverable)
@@ -314,6 +395,15 @@ func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge dom
 		return Confirmation{}, err
 	}
 
+	// Committed, so Postgres now owns these seats permanently and the transient
+	// claim has nothing left to protect. Dropping the keys puts the hold store
+	// back in step with the sale; the TTL would do it anyway, which is why a
+	// failure here is logged rather than returned - the booking is already real.
+	if _, err := s.holds.Release(ctx, current.EventID, current.SeatIDs, current.ID); err != nil {
+		s.log.WarnContext(ctx, "booking confirmed but its holds were not dropped; they will expire",
+			"reservation_id", current.ID, "error", err)
+	}
+
 	s.log.InfoContext(ctx, "reservation confirmed",
 		"reservation_id", out.ReservationID, "booking_id", out.Booking.ID, "seats", len(out.Tickets), "charge_id", charge.ChargeID)
 	return out, nil
@@ -329,7 +419,9 @@ func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge dom
 // whose charge actually succeeded loses their seat. That is why the timeout has
 // its own function rather than sharing this one with a flag.
 func (s *Saga) ReleaseDeclined(ctx context.Context, reservationID, reason string) error {
-	released, err := s.releasePendingReservation(ctx, reservationID)
+	// No recheck: a declined key is settled for good. Payment answers every
+	// later charge under it from that row, so no money can move under it.
+	released, err := s.releasePendingReservation(ctx, reservationID, false)
 	if err != nil {
 		return err
 	}
@@ -347,8 +439,13 @@ func (s *Saga) ReleaseDeclined(ctx context.Context, reservationID, reason string
 // doing the same writes, because the two are reached from opposite kinds of
 // evidence and they should be separately greppable when someone is working out
 // why a seat was freed.
+//
+// It is proof as of the moment Payment gave it, though, not of what comes next:
+// a retry already past Pay's fence can still land a charge after this commits.
+// So this release, unlike the others, queues the reservation for a recheck in
+// the same transaction (see Reconciler.recheckReleased).
 func (s *Saga) ReleaseNeverCharged(ctx context.Context, reservationID string) error {
-	released, err := s.releasePendingReservation(ctx, reservationID)
+	released, err := s.releasePendingReservation(ctx, reservationID, true)
 	if err != nil {
 		return err
 	}
@@ -365,9 +462,15 @@ func (s *Saga) ReleaseNeverCharged(ctx context.Context, reservationID string) er
 // customer is charged, and the seat they paid for is sold to somebody else
 // while they are still looking at a spinner. So no seat is touched, no
 // reservation status changes, and the reservation is marked as belonging to the
-// reconciliation job - which also stops the sweeper from releasing it when the
-// checkout window closes, because the sweeper would otherwise commit exactly
-// the same mistake ten minutes later.
+// reconciliation job.
+//
+// In P0 that mark was also what stopped the sweeper from releasing the seats
+// when the checkout window closed. There is no sweeper now - and that is not the
+// same as there being nothing left to stop. The Redis TTL releases these seats
+// entirely on its own, and it has never heard of payment_pending_since. So the
+// mark is only half the guard in P3; the other half is pushing the TTL out, and
+// leaving it out would violate D8 by doing nothing at all, which is the hardest
+// kind of violation to see in a diff.
 //
 // Unknown is not failed (D8). The cost of being wrong in this direction is a
 // seat held longer than necessary. The cost of being wrong in the other
@@ -376,16 +479,54 @@ func (s *Saga) LeavePendingForReconciliation(ctx context.Context, reservationID 
 	marked, err := s.reservations.MarkPaymentPending(ctx, reservationID)
 	if err != nil {
 		// Even this failing changes nothing about the seats. The reservation
-		// stays pending; the worst case is that the sweeper expires it and
-		// releases seats for a charge that may have succeeded - which is why
+		// stays pending; the worst case is that its hold lapses and the seats
+		// go back on sale under a charge that may have succeeded - which is why
 		// the error is loud.
-		s.log.ErrorContext(ctx, "could not mark reservation for reconciliation; its seats are now at risk of being swept",
+		s.log.ErrorContext(ctx, "could not mark reservation for reconciliation; its seats are now at risk of lapsing",
 			"reservation_id", reservationID, "error", err)
 		return err
 	}
+	s.KeepHold(ctx, reservationID)
 	s.log.WarnContext(ctx, "payment outcome unknown; reservation left pending for reconciliation",
-		"reservation_id", reservationID, "newly_marked", marked, "cause", cause)
+		"reservation_id", reservationID, "still_pending", marked, "cause", cause)
 	return fmt.Errorf("reservation %s: %w", reservationID, domain.ErrPaymentOutcomeUnknown)
+}
+
+// KeepHold pushes a reservation's Redis claims out by another full checkout
+// window, so seats under an unknown payment outcome do not go back on sale
+// while reconciliation is still working on them (D8).
+//
+// Called when the doubt starts, and again on every reconciliation pass that
+// fails to resolve it - one extension is good for one window, and the case this
+// exists for is Payment being unreachable for longer than that.
+//
+// Best-effort, and deliberately not an error return: every caller is already
+// handling something that went wrong, and none of them has a better move than
+// to log this and try again next pass. If the extension never lands the hold
+// lapses, the seats are resold, and reconciliation resolves the charge into an
+// automatic refund instead of a booking (§6.2 row 4) - worse for the customer,
+// still convergent, and never a double-booking.
+func (s *Saga) KeepHold(ctx context.Context, reservationID string) {
+	res, err := s.reservations.GetReservation(ctx, reservationID)
+	if err != nil {
+		s.log.ErrorContext(ctx, "could not read a reservation to extend its hold",
+			"reservation_id", reservationID, "error", err)
+		return
+	}
+	extended, err := s.holds.Extend(ctx, res.EventID, res.SeatIDs, res.ID, s.holdTTL)
+	if err != nil {
+		s.log.ErrorContext(ctx, "could not extend the hold on a reservation awaiting reconciliation; its seats may lapse",
+			"reservation_id", reservationID, "error", err)
+		return
+	}
+	if extended < len(res.SeatIDs) {
+		// Some keys were already gone. Nothing to be done about it here - the
+		// seats are back on sale and reconciliation will end up refunding - but
+		// it is the moment a paid customer stops being able to get their seat,
+		// so it is worth a line.
+		s.log.WarnContext(ctx, "some holds had already lapsed on a reservation awaiting reconciliation",
+			"reservation_id", reservationID, "extended", extended, "seats", len(res.SeatIDs))
+	}
 }
 
 // RefundUnconfirmable is §6.2 row 4: the money moved, but the reservation can
@@ -416,8 +557,10 @@ func (s *Saga) RefundUnconfirmable(ctx context.Context, res domain.Reservation, 
 
 	// Refunded, so the money is back. The reservation ends as failed rather
 	// than refunded: refunded is a state a *confirmed* booking reaches
-	// (FR-5.1), and this one never became a booking at all.
-	if _, err := s.releasePendingReservation(ctx, res.ID); err != nil {
+	// (FR-5.1), and this one never became a booking at all. No recheck: the
+	// charge under this key has succeeded and been refunded, and that settled
+	// row is what Payment answers any later charge under the key with.
+	if _, err := s.releasePendingReservation(ctx, res.ID, false); err != nil {
 		return err
 	}
 	s.log.WarnContext(ctx, "paid reservation could not be confirmed; refunded automatically",
@@ -483,52 +626,71 @@ func (s *Saga) ReleaseRefunded(ctx context.Context, reservationID string) error 
 	return nil
 }
 
-// releasePendingReservation is the write shared by the two release paths above.
+// releasePendingReservation is the write shared by the release paths above.
 //
 // It is unexported on purpose. The decision about whether releasing is safe is
 // the dangerous part and belongs to the named callers, each of which documents
 // the evidence that justifies it; this only performs the writes once that
-// decision has been made.
-func (s *Saga) releasePendingReservation(ctx context.Context, reservationID string) (int64, error) {
-	var released int64
+// decision has been made. recheckCharge is part of that decision: a caller whose
+// evidence is true only as of the moment it was given has the reservation
+// queued for a second look, in the transaction that releases it.
+func (s *Saga) releasePendingReservation(ctx context.Context, reservationID string, recheckCharge bool) (int, error) {
+	var res domain.Reservation
 
 	err := s.tx.WithinTx(ctx, func(ctx context.Context) error {
-		res, err := s.reservations.LockReservation(ctx, reservationID)
+		locked, err := s.reservations.LockReservation(ctx, reservationID)
 		if err != nil {
 			return err
 		}
-		switch res.Status {
+		res = locked
+		switch locked.Status {
 		case domain.ReservationPending:
 			// The expected case; fall through to the writes below.
 		case domain.ReservationFailed, domain.ReservationExpired:
-			// Already settled and already released. Nothing to undo.
+			// Already settled. Nothing to undo here - but still drop the keys
+			// below, because a settled reservation must not keep holding seats.
 			return nil
 		default:
-			return fmt.Errorf("reservation %s is %s and cannot be released: %w", res.ID, res.Status, domain.ErrInvalidTransition)
+			return fmt.Errorf("reservation %s is %s and cannot be released: %w", locked.ID, locked.Status, domain.ErrInvalidTransition)
 		}
 
-		seats, err := s.seats.LockSeatsByReservation(ctx, reservationID)
-		if err != nil {
+		// No seat row changes hands: an unconfirmed reservation never owned one.
+		// It held a Redis key, dropped below, and a claim row, settled here so
+		// the database says out loud that this attempt is over.
+		if _, err := s.reservations.ReleaseClaims(ctx, locked.ID); err != nil {
 			return err
 		}
-		for i := range seats {
-			if err := seats[i].Release(); err != nil {
-				return fmt.Errorf("release seat %s: %w", seats[i].ID, err)
-			}
-		}
-		if released, err = s.seats.ReleaseHeldSeats(ctx, reservationID); err != nil {
-			return err
-		}
-		ok, err := s.reservations.SetReservationStatus(ctx, res.ID, domain.ReservationPending, domain.ReservationFailed)
+		ok, err := s.reservations.SetReservationStatus(ctx, locked.ID, domain.ReservationPending, domain.ReservationFailed)
 		if err != nil {
 			return err
 		}
 		if !ok {
-			return fmt.Errorf("reservation %s moved out of pending under our lock: %w", res.ID, domain.ErrInvalidTransition)
+			return fmt.Errorf("reservation %s moved out of pending under our lock: %w", locked.ID, domain.ErrInvalidTransition)
+		}
+		if recheckCharge {
+			// Committed with the release or not at all: a release that lands
+			// without its recheck is the orphan the queue exists to prevent.
+			return s.reservations.QueueChargeRecheck(ctx, locked.ID)
 		}
 		return nil
 	})
-	return released, err
+	if err != nil {
+		return 0, err
+	}
+
+	// Outside the transaction, because it is a network call (D4). The seats are
+	// back on sale the instant these keys are gone (PRD §4.1 step 7).
+	//
+	// Best-effort: a failure costs the rest of one checkout window before the
+	// TTL frees the seats anyway, and returning it would turn a settled answer -
+	// "your card was declined" - into a 500 for a customer whose reservation is
+	// already correctly failed.
+	released, err := s.holds.Release(ctx, res.EventID, res.SeatIDs, res.ID)
+	if err != nil {
+		s.log.WarnContext(ctx, "reservation released but its holds were not dropped; they will expire",
+			"reservation_id", res.ID, "error", err)
+	}
+	return released, nil
 }
 
 // existingConfirmation returns the booking a reservation was already confirmed

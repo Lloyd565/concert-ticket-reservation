@@ -190,6 +190,15 @@ func (h *Handler) fail(w http.ResponseWriter, r *http.Request, err error) {
 		// level even though the client sees an ordinary conflict.
 		h.log.ErrorContext(r.Context(), "D13 backstop tripped - the seat locking path let a double claim through", "error", err)
 		writeError(w, http.StatusConflict, "seat_unavailable", "one or more seats are no longer available")
+	case errors.Is(err, domain.ErrHoldsUnavailable):
+		// 503, not 409, and the difference matters to the caller: 409 says the
+		// seat is gone, this says we cannot tell and will not guess (D12). The
+		// seats may be perfectly free; what is missing is the lock that hands
+		// one of them to exactly one person, so the only safe answer is to
+		// refuse and let them retry.
+		h.log.ErrorContext(r.Context(), "hold store unreachable; refusing holds rather than taking them unlocked", "error", err)
+		w.Header().Set("Retry-After", "5")
+		writeError(w, http.StatusServiceUnavailable, "holds_unavailable", "seat holds are temporarily unavailable; please retry")
 	case errors.Is(err, domain.ErrSeatUnavailable):
 		// A lost race is an expected outcome, not a server fault (FR-3.2).
 		writeError(w, http.StatusConflict, "seat_unavailable", "one or more seats are no longer available")

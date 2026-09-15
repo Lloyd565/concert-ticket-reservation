@@ -27,7 +27,7 @@ Reserving a seat is a mutation of seat state; the check and the write must be at
 Cross-service data access goes through APIs or events. Never a direct query into another service's tables.
 
 **D3 — Pessimistic locking, not optimistic.**
-Contention concentrates on a few desirable seats. Optimistic (version-column) retry loops fail hardest exactly when load is highest. Use `SELECT ... FOR UPDATE` (P0) then Redis `SET NX EX` (P3).
+Contention concentrates on a few desirable seats. Optimistic (version-column) retry loops fail hardest exactly when load is highest. `SELECT ... FOR UPDATE` in P0; since P3 the hold is `SET seat:hold:{event}:{seat} {reservation} NX EX 600` and multi-seat holds run as one Lua script. Postgres still takes `FOR UPDATE` at *confirmation*, where a transient hold becomes a permanent sale.
 
 **D4 — Never hold a DB transaction across an external call.**
 Claim seats → COMMIT → *then* call Payment. A lock spanning a network call turns a 5 ms transaction into a multi-second one under load.
@@ -43,7 +43,7 @@ One readable place holding the flow beats distributed event chains for both corr
 
 **D8 — Never blind-release seats on a payment timeout.**
 Unknown outcome ≠ failure. The charge may have succeeded. Leave the reservation `pending` and let the reconciliation job resolve it by idempotency key.
-There are **two** ways to break this, and the second is the one that gets missed: the saga must not release, *and neither must the sweeper*. A reservation with an unknown payment outcome is marked (`reservations.payment_pending_since`) and every expiry path skips it. Reconciliation is then its only owner, so that job must run well inside the hold TTL.
+There are **two** ways to break this, and the second is the one that gets missed: the saga must not release, *and neither must expiry*. In P0 that meant a `WHERE` clause keeping the sweeper off marked reservations. Since P3 expiry is a Redis TTL, which runs no SQL and answers no questions, so the guard is an action instead: `Saga.KeepHold` pushes the hold out when the outcome becomes unknown and on every reconciliation pass that cannot resolve it. `reservations.payment_pending_since` still marks the reservation — written *before* the payment call, so a Booking crash mid-call still leaves a reservation reconciliation will find; reconciliation is still its only owner, so that job must run well inside the hold TTL.
 
 **D9 — Transactional outbox for all event publication.**
 Write state change + outbox row in one DB transaction; a relay publishes. Prevents lost events on crash.
@@ -58,7 +58,7 @@ Without them, a retry is a double-charge or a double-book.
 If holds can't be taken safely, reject new holds. Never fall back to an unlocked path.
 
 **D13 — Database-level backstop.**
-A partial unique index enforcing one active claim per seat. If application logic is ever wrong, the database still refuses.
+A partial unique index on `reservation_seats (seat_id) WHERE confirmed_at IS NOT NULL AND released_at IS NULL`: one **confirmed** claim per seat, which is the invariant word for word. If the Redis claim path is ever wrong, the database still refuses. (In P0 it enforced one *live* claim; that cannot survive a TTL, because an expired hold leaves no writer to stamp its claim released and the seat would be blocked forever.)
 
 **D14 — The gateway validates access tokens locally; it never calls Auth per request.**
 Signature, `exp`/`nbf`/`iat`, `iss`/`aud`, claim shape and role-vs-route are all decided from the token itself, with the algorithm pinned to HS256. What that cannot see — a user deleted, demoted or logged out since the token was minted — is bounded by the 15-minute access TTL and closed at the next refresh, which is a call to Auth by definition. Introspecting a token on every request would make Auth a hard dependency of every request in the system. See ARCHITECTURE.md §4.4.
@@ -76,7 +76,7 @@ available ──hold──> held ──confirm──> booked ──refund──>
     ▲                 │
     └──expire/release─┘
 ```
-Transitions validated in `domain`. Illegal transition = domain error, never a silent no-op.
+Since P3 `held` is a Redis key, not a column: the seat row is `available` or `booked` and moves straight between them. Transitions validated in `domain`. Illegal transition = domain error, never a silent no-op.
 
 ## Saga: happy path
 
@@ -88,7 +88,7 @@ Transitions validated in `domain`. Illegal transition = domain error, never a si
 |---|---|
 | Payment declined | Release seats, reservation → `failed` |
 | Payment timeout (unknown) | Stay `pending`; reconciliation resolves by idempotency key (**D8**) |
-| Hold expired | TTL/sweeper releases, reservation → `expired` |
+| Hold expired | The Redis TTL releases the seats unaided; the reservation is left `pending` with a past deadline and is not payable (expiry is derived, not swept) |
 | Paid but confirm failed | Reconciliation retries confirm; if unrecoverable → auto-refund |
 | Refund requested | Payment refunds → Booking releases seats, booking → `refunded` |
 
@@ -120,7 +120,7 @@ Dependencies point inward, always.
 | **P0** | Booking monolith, Postgres `FOR UPDATE`, `held_until` column | **Concurrency test passes** |
 | **P1** | Auth service + Gateway | Independent services, routing works |
 | **P2** | Payment service + Saga | Payment failure demonstrably releases seats; payment *timeout* demonstrably does not (`make test-saga`) |
-| **P3** | Redis TTL holds, multi-replica Booking | Holds expire without sweeper; concurrency test green with 2+ replicas |
+| **P3** ✅ | Redis TTL holds, multi-replica Booking, sweeper retired | Holds expire without sweeper; concurrency test green with 2 replicas; Redis loss fails holds closed |
 | **P4** | Event bus + Notification | Killing Notification doesn't break booking |
 | **P5** | Tracing, metrics, circuit breakers, DLQ | Request traceable end-to-end |
 
@@ -128,4 +128,4 @@ P0 must pass before any split. Correctness precedes distribution.
 
 ## The test that matters most
 
-Fire 50+ concurrent hold requests at a single seat against a real Postgres (`testcontainers-go`). Assert **exactly one** succeeds. Write it in P0. Keep it green through every phase. Re-run it after every architectural change.
+Fire 50+ concurrent hold requests at a single seat against a real PostgreSQL and a real Redis (`testcontainers-go`), split across **two independent Booking replicas** with separate pools and clients. Assert **exactly one** succeeds. Write it in P0. Keep it green through every phase. Re-run it after every architectural change.

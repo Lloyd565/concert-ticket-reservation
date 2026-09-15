@@ -4,25 +4,33 @@
 // free of any external type; parsing and formatting happen in repository.
 package domain
 
-import "time"
-
-// SeatStatus is the lifecycle state of a single seat for a single event.
-type SeatStatus string
-
-const (
-	SeatAvailable SeatStatus = "available"
-	SeatHeld      SeatStatus = "held"
-	SeatBooked    SeatStatus = "booked"
-)
-
-// seatTransitions is the seat state machine (ARCHITECTURE.md §5.3):
+// SeatStatus is the lifecycle state of a single seat for a single event, as the
+// seat catalog records it.
+//
+// There are two values, not three, and the missing one is the interesting one.
+// The full state machine (ARCHITECTURE.md §5.3) is:
 //
 //	available ──hold──> held ──confirm──> booked ──refund──> available
 //	    ▲                 │
 //	    └──expire/release─┘
+//
+// In P3 the held state moved to Redis, where a key with a TTL expires itself
+// (D3, ARCHITECTURE.md §5.2). It is deliberately not representable here: a hold
+// recorded in Postgres is a hold nothing can expire without a sweeper, and the
+// sweeper is what P3 retires. So the catalog row goes straight from available to
+// booked when a hold is redeemed, and the intermediate state is a Redis key that
+// this layer never sees.
+type SeatStatus string
+
+const (
+	SeatAvailable SeatStatus = "available"
+	SeatBooked    SeatStatus = "booked"
+)
+
+// seatTransitions is what a seat catalog row may do. Holding is absent for the
+// reason above; confirming a hold is available -> booked.
 var seatTransitions = map[SeatStatus]map[SeatStatus]bool{
-	SeatAvailable: {SeatHeld: true},
-	SeatHeld:      {SeatBooked: true, SeatAvailable: true},
+	SeatAvailable: {SeatBooked: true},
 	SeatBooked:    {SeatAvailable: true},
 }
 
@@ -32,64 +40,28 @@ func (s SeatStatus) CanTransition(to SeatStatus) bool { return seatTransitions[s
 // Seat is one physical seat for one event. It is the contended resource the
 // whole system exists to protect.
 type Seat struct {
-	ID        string
-	EventID   string
-	Section   string
-	Row       string
-	Number    string
-	Status    SeatStatus
-	HeldBy    string     // reservation ID holding this seat; empty unless held
-	HeldUntil *time.Time // expiry of the current hold; nil unless held
+	ID      string
+	EventID string
+	Section string
+	Row     string
+	Number  string
+	Status  SeatStatus
 	// PriceCents is what this seat costs. Integer cents; money is never a
 	// float (AGENTS.md §5).
 	PriceCents int64
 }
 
-// Available reports whether the seat can currently be claimed.
+// Available reports whether the seat can still be sold. A seat somebody is
+// holding in Redis right now is available by this answer - the hold is checked
+// where holds live, not here.
 func (s *Seat) Available() bool { return s.Status == SeatAvailable }
 
-// Hold moves an available seat to held until the given deadline.
-func (s *Seat) Hold(reservationID string, until time.Time) error {
-	if err := s.transition(SeatHeld); err != nil {
-		return err
-	}
-	s.HeldBy = reservationID
-	u := until
-	s.HeldUntil = &u
-	return nil
-}
-
-// Confirm moves a held seat to booked. Both pieces of hold metadata are
-// cleared: a booked seat is claimed permanently, not until a deadline, and the
-// claim is recorded by the booking and reservation_seats rows rather than by a
-// pointer on the seat. The database says the same thing - its
-// seats_hold_metadata_consistent check requires a non-held seat to carry
-// neither - so leaving HeldBy set here would make the entity disagree with the
-// row it is about to be written to.
-func (s *Seat) Confirm() error {
-	if err := s.transition(SeatBooked); err != nil {
-		return err
-	}
-	s.HeldBy = ""
-	s.HeldUntil = nil
-	return nil
-}
-
-// Release returns a held seat to available. It covers both explicit
-// cancellation and hold expiry - the resulting state is identical.
-func (s *Seat) Release() error { return s.toAvailable() }
+// Confirm moves an available seat to booked: the moment a transient hold
+// becomes a permanent sale.
+func (s *Seat) Confirm() error { return s.transition(SeatBooked) }
 
 // Refund returns a booked seat to available after a refund.
-func (s *Seat) Refund() error { return s.toAvailable() }
-
-func (s *Seat) toAvailable() error {
-	if err := s.transition(SeatAvailable); err != nil {
-		return err
-	}
-	s.HeldBy = ""
-	s.HeldUntil = nil
-	return nil
-}
+func (s *Seat) Refund() error { return s.transition(SeatAvailable) }
 
 func (s *Seat) transition(to SeatStatus) error {
 	if !s.Status.CanTransition(to) {

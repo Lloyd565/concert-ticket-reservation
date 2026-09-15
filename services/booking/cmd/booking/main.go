@@ -1,9 +1,12 @@
 // Command booking is the Booking service: the seat-state authority.
 //
-// P1 adds a gRPC door beside the existing REST one so the gateway can route to
-// it (ARCHITECTURE.md §4). Payment, Redis and the broker still arrive in later
-// phases. This service starts and stops independently of Auth and the gateway:
-// nothing here dials either of them.
+// P3 makes it replicable. Seat holds live in Redis rather than in this
+// process or in a Postgres column, so two or more of these run side by side
+// against one database and one Redis with no coordination between them - and
+// no sweeper, because a Redis key expires by itself.
+//
+// This service starts and stops independently of Auth and the gateway: nothing
+// here dials either of them.
 //
 // This file does wiring, configuration and graceful shutdown only.
 package main
@@ -20,6 +23,7 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+	goredis "github.com/redis/go-redis/v9"
 	"google.golang.org/grpc"
 
 	bookingv1 "github.com/lloyd565/concert-ticket-reservation/proto/booking/v1"
@@ -29,6 +33,7 @@ import (
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/logging"
 	paymentclient "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/payment"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/postgres"
+	bookingredis "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/redis"
 	bookinggrpc "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/transport/grpc"
 	bookinghttp "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/transport/http"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/usecase"
@@ -51,8 +56,8 @@ func run(log *slog.Logger) error {
 		return err
 	}
 
-	// Shutdown is driven by a signal-scoped context: the sweeper and the HTTP
-	// server both stop from the same cancellation.
+	// Shutdown is driven by a signal-scoped context: the reconciliation job and
+	// the HTTP server both stop from the same cancellation.
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
@@ -65,6 +70,14 @@ func run(log *slog.Logger) error {
 	repo := postgres.NewRepo(pool)
 	txm := postgres.NewTxManager(pool)
 
+	// The hold store, which in P3 is the lock on the hottest path in the system.
+	// Lazily connected like every other client here: a Booking replica that
+	// cannot reach Redis still serves seat maps and still reports itself
+	// unready, and refuses holds rather than taking them unlocked (D12).
+	redisClient := goredis.NewClient(&goredis.Options{Addr: cfg.RedisAddr})
+	defer func() { _ = redisClient.Close() }()
+	holds := bookingredis.NewHolds(redisClient)
+
 	// The one synchronous service-to-service call in the system. Lazy dial:
 	// Booking serves seat maps and holds whether or not Payment is up
 	// (ARCHITECTURE.md §3.3), and only the pay step needs it.
@@ -75,26 +88,36 @@ func run(log *slog.Logger) error {
 	}
 	defer func() { _ = paymentConn.Close() }()
 
-	holder := usecase.NewHolder(txm, repo, repo, cfg.HoldTTL)
+	holder := usecase.NewHolder(txm, holds, repo, repo, cfg.HoldTTL, log)
 	seeder := usecase.NewSeeder(txm, repo)
-	sweeper := usecase.NewSweeper(repo, cfg.SweepInterval, log)
-	saga := usecase.NewSaga(txm, repo, repo, repo, paymentPort{paymentClient}, log)
+	saga := usecase.NewSaga(txm, holds, repo, repo, repo, paymentPort{paymentClient}, cfg.HoldTTL, log)
 	reconciler := usecase.NewReconciler(saga, repo, paymentPort{paymentClient},
 		cfg.ReconcileInterval, cfg.ReconcileGrace, 0, log)
 
-	// The P0 expiry mechanism. Redis TTLs replace it in P3; until then an
-	// abandoned checkout is released here and nowhere else - except for
-	// reservations whose payment outcome is unknown, which the sweeper is
-	// forbidden to touch and the reconciler below owns instead (D8).
-	go sweeper.Run(ctx)
+	// No sweeper. An abandoned checkout is released by the Redis key expiring,
+	// which needs no process, no ticker and no replica to be the one that owns
+	// it - the reason P3 can run more than one of these at all.
+	//
+	// The reconciliation job is the exception, and stays: reservations whose
+	// payment outcome is unknown must NOT expire on their own, so it both
+	// resolves them and keeps their holds alive while it works (D8). Every
+	// replica runs one; each pass claims its work by row lock, so two replicas
+	// racing the same reservation is safe rather than merely unlikely.
 	go reconciler.Run(ctx)
 
 	handler := bookinghttp.NewHandler(holder, seeder, saga, log)
-	// Readiness includes the dependency check (NFR-4.4): without the database
-	// this service cannot claim a seat, so it is not ready.
+	// Readiness includes both dependency checks (NFR-4.4). Redis is in there
+	// for the same reason Postgres is: without it this replica cannot claim a
+	// seat, and D12 forbids it from pretending otherwise, so it should be taken
+	// out of rotation rather than left answering 503 to every hold.
 	srv := &http.Server{
-		Addr:              ":" + cfg.HTTPPort,
-		Handler:           handler.Routes(func() error { return pool.Ping(ctx) }),
+		Addr: ":" + cfg.HTTPPort,
+		Handler: handler.Routes(func() error {
+			if err := pool.Ping(ctx); err != nil {
+				return err
+			}
+			return holds.Ping(ctx)
+		}),
 		ReadHeaderTimeout: 5 * time.Second,
 	}
 
@@ -109,7 +132,7 @@ func run(log *slog.Logger) error {
 
 	errc := make(chan error, 2)
 	go func() {
-		log.Info("booking listening", "addr", srv.Addr, "hold_ttl", cfg.HoldTTL.String(), "sweep_interval", cfg.SweepInterval.String())
+		log.Info("booking listening", "addr", srv.Addr, "hold_ttl", cfg.HoldTTL.String(), "redis", cfg.RedisAddr)
 		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errc <- err
 		}

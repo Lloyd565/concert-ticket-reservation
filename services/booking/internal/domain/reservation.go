@@ -37,10 +37,12 @@ type Reservation struct {
 	ExpiresAt      time.Time
 	IdempotencyKey string
 	CreatedAt      time.Time
-	// PaymentPendingSince is set when a payment call returned an UNKNOWN
-	// outcome. While it is set, this reservation is owned by the reconciliation
-	// job and nothing else may release its seats (D8) - not the sweeper, not a
-	// retry of the saga. Nil means no charge is in doubt.
+	// PaymentPendingSince is set just before a payment call is made and cleared
+	// when the reservation settles. While it is set a charge may exist whose
+	// outcome nobody knows, so this reservation is owned by the reconciliation
+	// job and nothing else may release its seats (D8) - not a retry of the
+	// saga, and not the Redis TTL, which the job keeps pushing out for exactly
+	// this reason. Nil means no charge is in doubt.
 	PaymentPendingSince *time.Time
 }
 

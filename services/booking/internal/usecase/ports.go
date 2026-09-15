@@ -20,29 +20,47 @@ type TxManager interface {
 	WithinTx(ctx context.Context, fn func(context.Context) error) error
 }
 
-// SeatRepository is the seat-state port.
-type SeatRepository interface {
-	// LockSeatsForUpdate takes row-level write locks on the given seats, in
-	// sorted seat-ID order, and returns their state as of the lock. Only
-	// meaningful inside a transaction.
-	LockSeatsForUpdate(ctx context.Context, eventID string, seatIDs []string) ([]domain.Seat, error)
-	// MarkSeatsHeld flips seats to held and reports how many rows changed.
-	MarkSeatsHeld(ctx context.Context, seatIDs []string, reservationID string, until time.Time) (int64, error)
-	// ListSeatsByEvent returns the seat map for an event.
-	ListSeatsByEvent(ctx context.Context, eventID string) ([]domain.Seat, error)
-	// ReleaseExpiredHolds frees seats whose checkout window closed and marks
-	// their reservations expired. Returns the number of seats freed. It skips
-	// reservations whose payment outcome is unknown (D8).
-	ReleaseExpiredHolds(ctx context.Context) (int64, error)
+// HoldStore is the seat-hold port: Redis in production (D3, ARCHITECTURE.md
+// §5.2). It is the lock. Everything in it fails closed - a method that cannot
+// reach the store returns domain.ErrHoldsUnavailable and claims nothing, and no
+// caller may treat that as permission to proceed unlocked (D12).
+type HoldStore interface {
+	// Claim atomically claims every seat for reservationID for ttl, or claims
+	// none (D6). A seat already held returns domain.ErrSeatUnavailable.
+	Claim(ctx context.Context, eventID string, seatIDs []string, reservationID string, ttl time.Duration) error
+	// Release drops the claims this reservation still owns, reporting how many
+	// were dropped. A claim that has expired, or been re-taken by somebody
+	// else, is left alone.
+	Release(ctx context.Context, eventID string, seatIDs []string, reservationID string) (int, error)
+	// Extend pushes the expiry of the claims this reservation still owns out to
+	// ttl from now. This is how D8 survives a TTL: seats under an unknown
+	// payment outcome must not go back on sale on their own.
+	Extend(ctx context.Context, eventID string, seatIDs []string, reservationID string, ttl time.Duration) (int, error)
+	// Owns reports whether this reservation still holds every one of the seats.
+	Owns(ctx context.Context, eventID string, seatIDs []string, reservationID string) (bool, error)
+	// Ping reports whether holds can be taken at all, for readiness.
+	Ping(ctx context.Context) error
+}
 
-	// LockSeatsByReservation locks the seats a reservation actively claims, in
-	// sorted seat-ID order (D5). Only meaningful inside a transaction.
+// SeatRepository is the seat-catalog port.
+//
+// In P3 it is a catalog, not a lock. Holding a seat happens in HoldStore; what
+// is left here is what a seat costs, whether it has been sold, and the
+// available -> booked transition that a confirmed booking is made of.
+type SeatRepository interface {
+	// GetSeats returns the requested seats' catalog rows, in sorted seat-ID
+	// order. It takes no locks.
+	GetSeats(ctx context.Context, eventID string, seatIDs []string) ([]domain.Seat, error)
+	// ListSeatsByEvent returns the seat map for an event. Seats held in the
+	// hold store still read as available: that state does not live here.
+	ListSeatsByEvent(ctx context.Context, eventID string) ([]domain.Seat, error)
+
+	// LockSeatsByReservation locks the seats a reservation claims, in sorted
+	// seat-ID order (D5). Only meaningful inside a transaction.
 	LockSeatsByReservation(ctx context.Context, reservationID string) ([]domain.Seat, error)
-	// MarkSeatsBooked flips a reservation's held seats to booked.
+	// MarkSeatsBooked flips a reservation's available seats to booked and
+	// stamps its claims confirmed.
 	MarkSeatsBooked(ctx context.Context, reservationID string) (int64, error)
-	// ReleaseHeldSeats returns a reservation's held seats to available and
-	// stamps its claims released.
-	ReleaseHeldSeats(ctx context.Context, reservationID string) (int64, error)
 	// ReleaseBookedSeats returns a reservation's booked seats to available,
 	// for a refund.
 	ReleaseBookedSeats(ctx context.Context, reservationID string) (int64, error)
@@ -66,12 +84,26 @@ type ReservationRepository interface {
 	// whether the row was still in the from state. False means a concurrent
 	// writer got there first; the caller lost and must not assume otherwise.
 	SetReservationStatus(ctx context.Context, id string, from, to domain.ReservationStatus) (bool, error)
+	// ReleaseClaims settles an unconfirmed reservation's claim rows. It touches
+	// no seat: an unconfirmed claim never owned one.
+	ReleaseClaims(ctx context.Context, reservationID string) (int64, error)
 	// MarkPaymentPending records that a charge may exist for this reservation
-	// whose outcome nobody knows, handing it to the reconciliation job (D8).
+	// whose outcome nobody knows, handing it to the reconciliation job (D8). It
+	// reports whether the reservation was still pending: false means it has
+	// settled, and no charge may be started for it.
 	MarkPaymentPending(ctx context.Context, id string) (bool, error)
 	// ListReservationsAwaitingReconciliation returns pending reservations whose
 	// payment outcome has been unknown since before olderThan.
 	ListReservationsAwaitingReconciliation(ctx context.Context, olderThan time.Time, limit int) ([]domain.Reservation, error)
+	// QueueChargeRecheck queues a reservation released on "no charge" evidence
+	// for one more look at its charge key. Must run in the release's
+	// transaction.
+	QueueChargeRecheck(ctx context.Context, reservationID string) error
+	// ListReservationsAwaitingChargeRecheck returns queued reservations
+	// released before olderThan.
+	ListReservationsAwaitingChargeRecheck(ctx context.Context, olderThan time.Time, limit int) ([]domain.Reservation, error)
+	// ClearChargeRecheck removes a reservation from the recheck queue.
+	ClearChargeRecheck(ctx context.Context, reservationID string) error
 }
 
 // BookingRepository is the confirmed-purchase port.

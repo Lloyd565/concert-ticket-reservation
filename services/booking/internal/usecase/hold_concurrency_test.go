@@ -19,23 +19,36 @@ import (
 // (AGENTS.md §9).
 const concurrentHolders = 64
 
+// bookingReplicas is how many independent Booking replicas the holders are
+// spread across. P3's exit criterion is that the invariant survives with more
+// than one (ARCHITECTURE-ESSENTIALS.md build order).
+const bookingReplicas = 2
+
 // TestHoldSeatsConcurrent is the executable proof of the project's one
 // invariant: a given seat for a given event is confirmed to at most one
 // booking, under any level of concurrency (PRD §1).
 //
-// Every goroutine requests the same single seat at the same moment, against a
-// real PostgreSQL instance. Exactly one must win; every other must lose with
-// domain.ErrSeatUnavailable - a distinguishable conflict, not a 500 and not a
-// deadlock (FR-3.2).
+// Every goroutine requests the same single seat at the same moment - half of
+// them through one Booking replica, half through another, each replica with its
+// own connection pool and its own Redis client, sharing nothing in this process.
+// Exactly one must win; every other must lose with domain.ErrSeatUnavailable - a
+// distinguishable conflict, not a 500 and not a deadlock (FR-3.2).
+//
+// Splitting the callers across replicas is what makes this a P3 test rather
+// than a rerun of P0's. An in-process lock, an accidental singleton, a cache
+// that happened to be shared - anything that made P0 pass without the storage
+// layer actually serialising these callers - fails here, because the two
+// replicas have no way to agree except through Redis.
 func TestHoldSeatsConcurrent(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	f := newFixture(t, time.Minute)
-	eventID, seatID := seedOneSeat(t, f)
+	replicas := newReplicas(t, bookingReplicas, time.Minute)
+	eventID, seatID := seedOneSeat(t, replicas[0])
 
 	type outcome struct {
 		reservationID string
+		replica       int
 		err           error
 	}
 	outcomes := make([]outcome, concurrentHolders)
@@ -49,7 +62,8 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 	done.Add(concurrentHolders)
 
 	for i := 0; i < concurrentHolders; i++ {
-		go func(i int) {
+		replica := i % bookingReplicas
+		go func(i, replica int) {
 			defer done.Done()
 			// Distinct user and idempotency key per caller: this is 64 different
 			// people wanting the same seat, not one client retrying.
@@ -57,9 +71,9 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 			key := uuid.Must(uuid.NewV7()).String()
 			ready.Done()
 			<-start
-			held, err := f.holder.HoldSeats(ctx, eventID, []string{seatID}, userID, key)
-			outcomes[i] = outcome{reservationID: held.ReservationID, err: err}
-		}(i)
+			held, err := replicas[replica].holder.HoldSeats(ctx, eventID, []string{seatID}, userID, key)
+			outcomes[i] = outcome{reservationID: held.ReservationID, replica: replica, err: err}
+		}(i, replica)
 	}
 
 	ready.Wait()
@@ -74,18 +88,22 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 		switch {
 		case o.err == nil:
 			winners = append(winners, o.reservationID)
+			t.Logf("replica %d won the seat with reservation %s", o.replica, o.reservationID)
 		case errors.Is(o.err, domain.ErrBackstopTripped):
 			// The invariant survived, but only because the database refused the
-			// write. That means SELECT ... FOR UPDATE did not serialise these
-			// callers - the very thing this test exists to prove. Passing on the
+			// write. That means the Redis claim did not serialise these callers
+			// - the very thing this test exists to prove. Passing on the
 			// backstop alone would be passing for the wrong reason.
-			t.Errorf("holder %d was stopped by the D13 database backstop, not by the seat lock: %v", i, o.err)
+			t.Errorf("holder %d (replica %d) was stopped by the D13 database backstop, not by the hold store: %v", i, o.replica, o.err)
+		case errors.Is(o.err, domain.ErrHoldsUnavailable):
+			// Failing closed is correct behaviour, but not here: Redis is up.
+			t.Errorf("holder %d (replica %d) could not reach the hold store: %v", i, o.replica, o.err)
 		case errors.Is(o.err, domain.ErrSeatUnavailable):
 			conflicts++
 		default:
-			// A deadlock (40P01), a pool timeout or a leaked SQL error all land
-			// here. Any of them means the locking design is wrong, not flaky.
-			t.Errorf("holder %d failed with an unexpected error: %v", i, o.err)
+			// A pool timeout or a leaked SQL error lands here. Either means the
+			// design is wrong, not that the test is flaky.
+			t.Errorf("holder %d (replica %d) failed with an unexpected error: %v", i, o.replica, o.err)
 		}
 	}
 
@@ -96,31 +114,37 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 		t.Fatalf("want %d seat-unavailable conflicts, got %d", concurrentHolders-1, conflicts)
 	}
 
-	// The in-memory tally agrees. Now confirm the database agrees too: a test
-	// that only counted return values could be fooled by two writes where the
-	// second silently overwrote the first.
-	seats, err := f.repo.ListSeatsByEvent(ctx, eventID)
+	// The in-memory tally agrees. Now confirm the stores agree too: a test that
+	// only counted return values could be fooled by two writes where the second
+	// silently overwrote the first.
+	//
+	// Redis first, because Redis is the authority on who holds this seat. One
+	// key, one value, and it is the winner's reservation.
+	if got := holder(t, ctx, replicas[0], eventID, seatID); got != winners[0] {
+		t.Fatalf("the seat is held by %q, but the winning reservation was %s", got, winners[0])
+	}
+	ttl, err := replicas[0].redis.TTL(ctx, holdKey(eventID, seatID)).Result()
+	if err != nil {
+		t.Fatalf("read hold ttl: %v", err)
+	}
+	if ttl <= 0 || ttl > time.Minute {
+		// A hold with no expiry is a seat leak with extra steps: it is the
+		// exact failure the sweeper existed to paper over.
+		t.Fatalf("want a hold expiring within the checkout window, got a TTL of %s", ttl)
+	}
+
+	// Postgres, meanwhile, still calls the seat available - nothing has been
+	// sold. That is not a discrepancy, it is the design: Postgres is the source
+	// of truth for confirmed bookings, and there is no booking here.
+	seats, err := replicas[0].repo.ListSeatsByEvent(ctx, eventID)
 	if err != nil {
 		t.Fatalf("list seats: %v", err)
 	}
 	if len(seats) != 1 {
 		t.Fatalf("want 1 seat in the map, got %d", len(seats))
 	}
-	if seats[0].Status != domain.SeatHeld {
-		t.Fatalf("want the seat held, got %s", seats[0].Status)
-	}
-	if seats[0].HeldBy != winners[0] {
-		t.Fatalf("seat is held by %s, but the winning reservation was %s", seats[0].HeldBy, winners[0])
-	}
-
-	var activeClaims int
-	if err := testPool.QueryRow(ctx,
-		`SELECT count(*) FROM reservation_seats WHERE seat_id = $1 AND released_at IS NULL`,
-		seatID).Scan(&activeClaims); err != nil {
-		t.Fatalf("count active claims: %v", err)
-	}
-	if activeClaims != 1 {
-		t.Fatalf("want exactly 1 active claim on the seat, got %d", activeClaims)
+	if seats[0].Status != domain.SeatAvailable {
+		t.Fatalf("want the seat still unsold in Postgres, got %s", seats[0].Status)
 	}
 
 	var pending int
@@ -134,17 +158,23 @@ func TestHoldSeatsConcurrent(t *testing.T) {
 	}
 }
 
-// TestHoldSeatsConcurrentMultiSeat covers the deadlock scenario D5 exists to
-// prevent: concurrent multi-seat holds whose requested order differs. Without
-// sorted lock acquisition these transactions wait on each other in a cycle and
-// Postgres kills one with a 40P01 - which would surface here as an unexpected
-// error rather than a clean conflict.
+// TestHoldSeatsConcurrentMultiSeat covers all-or-nothing under contention (D6):
+// concurrent multi-seat holds, in opposite request orders, across both replicas.
+//
+// In P0 this was the deadlock test - two transactions locking the same rows in
+// different orders is the classic cycle, and sorted acquisition is what
+// prevented it. The Lua script removes the possibility rather than managing it:
+// a script runs to completion with nothing interleaved, so there is no window in
+// which two callers each hold part of what the other wants. What the test now
+// proves is the other half of D6 - that a claim which fails partway gives back
+// every key it had already taken, leaving no seat stranded for a whole TTL under
+// a reservation that never existed.
 func TestHoldSeatsConcurrentMultiSeat(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancel()
 
-	f := newFixture(t, time.Minute)
-	ev, seats, err := f.seeder.Seed(ctx, seedSpecFor(t, 4))
+	replicas := newReplicas(t, bookingReplicas, time.Minute)
+	ev, seats, err := replicas[0].seeder.Seed(ctx, seedSpecFor(t, 4))
 	if err != nil {
 		t.Fatalf("seed event: %v", err)
 	}
@@ -165,15 +195,16 @@ func TestHoldSeatsConcurrentMultiSeat(t *testing.T) {
 		if i%2 == 1 {
 			order = reverse
 		}
-		go func(i int, order []string) {
+		replica := i % bookingReplicas
+		go func(i, replica int, order []string) {
 			defer done.Done()
 			userID := uuid.Must(uuid.NewV7()).String()
 			key := uuid.Must(uuid.NewV7()).String()
 			ready.Done()
 			<-start
-			_, err := f.holder.HoldSeats(ctx, ev.ID, order, userID, key)
+			_, err := replicas[replica].holder.HoldSeats(ctx, ev.ID, order, userID, key)
 			errs[i] = err
-		}(i, order)
+		}(i, replica, order)
 	}
 
 	ready.Wait()
@@ -186,25 +217,31 @@ func TestHoldSeatsConcurrentMultiSeat(t *testing.T) {
 		case err == nil:
 			winners++
 		case errors.Is(err, domain.ErrBackstopTripped):
-			t.Errorf("holder %d was stopped by the D13 database backstop, not by the seat lock: %v", i, err)
+			t.Errorf("holder %d was stopped by the D13 database backstop, not by the hold store: %v", i, err)
+		case errors.Is(err, domain.ErrHoldsUnavailable):
+			t.Errorf("holder %d could not reach the hold store: %v", i, err)
 		case errors.Is(err, domain.ErrSeatUnavailable):
 		default:
-			t.Errorf("holder %d failed with an unexpected error (a deadlock would appear here): %v", i, err)
+			t.Errorf("holder %d failed with an unexpected error: %v", i, err)
 		}
 	}
 	if winners != 1 {
 		t.Fatalf("want exactly 1 successful 4-seat hold, got %d", winners)
 	}
 
-	// All-or-nothing across the whole set (D6): every seat belongs to the one
-	// winner, or the hold should not have happened at all.
-	seatsAfter, err := f.repo.ListSeatsByEvent(ctx, ev.ID)
-	if err != nil {
-		t.Fatalf("list seats: %v", err)
-	}
-	for _, s := range seatsAfter {
-		if s.Status != domain.SeatHeld {
-			t.Fatalf("seat %s/%s is %s, want all four held by the winner", s.Row, s.Number, s.Status)
+	// All four seats belong to the one winner, and no fifth key survives from a
+	// request that failed halfway through its own claim.
+	var winner string
+	for _, id := range ids {
+		got := holder(t, ctx, replicas[0], ev.ID, id)
+		if got == "" {
+			t.Fatalf("seat %s is held by nobody; the winning hold was not all-or-nothing", id)
+		}
+		if winner == "" {
+			winner = got
+		}
+		if got != winner {
+			t.Fatalf("seat %s is held by %s but seat %s is held by %s: a partial hold survived", id, got, ids[0], winner)
 		}
 	}
 }

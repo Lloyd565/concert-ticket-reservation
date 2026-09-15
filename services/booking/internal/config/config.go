@@ -16,9 +16,14 @@ type Config struct {
 	// GRPCPort serves the internal API the gateway routes to (ARCHITECTURE.md
 	// §4). REST stays on HTTPPort: the two transports are separate doors onto
 	// the same usecase, not a replacement of one by the other.
-	GRPCPort      string
-	HoldTTL       time.Duration
-	SweepInterval time.Duration
+	GRPCPort string
+	// RedisAddr is the hold store, and in P3 it is the lock: no Redis, no
+	// holds. The service still starts without it and still serves seat maps,
+	// but every hold request is refused rather than taken unlocked (D12).
+	RedisAddr string
+	// HoldTTL is the checkout window. In P3 it is a real TTL on a Redis key,
+	// so it expires with nobody having to come back and look.
+	HoldTTL time.Duration
 
 	// PaymentAddr is the Payment service's gRPC address. Dialled lazily:
 	// Booking must serve seat maps and holds whether or not Payment is up
@@ -39,11 +44,14 @@ type Config struct {
 	BreakerCooldown  time.Duration
 
 	// ReconcileInterval is how often the reconciliation job sweeps. It must
-	// stay well under HoldTTL: the reservations it owns are the ones the
-	// sweeper is forbidden to touch, so nothing else will free their seats.
+	// stay well under HoldTTL: every pass is also what pushes the Redis holds
+	// of the reservations it owns back out, and a pass that arrives after the
+	// TTL has lapsed arrives too late to keep them (D8).
 	ReconcileInterval time.Duration
 	// ReconcileGrace is how long a payment outcome may stay unknown before the
-	// job intervenes.
+	// job intervenes, and how long after a "no charge" release it waits before
+	// asking Payment again. It must exceed PaymentTimeout, or that second look
+	// can come before a charge started ahead of the release has landed.
 	ReconcileGrace time.Duration
 }
 
@@ -51,11 +59,11 @@ type Config struct {
 // starts without a database is a service that reports healthy and serves errors.
 func Load() (Config, error) {
 	cfg := Config{
-		DatabaseURL:   os.Getenv("BOOKING_DATABASE_URL"),
-		HTTPPort:      env("BOOKING_HTTP_PORT", "8080"),
-		GRPCPort:      env("BOOKING_GRPC_PORT", "9092"),
-		HoldTTL:       10 * time.Minute,
-		SweepInterval: 5 * time.Second,
+		DatabaseURL: os.Getenv("BOOKING_DATABASE_URL"),
+		HTTPPort:    env("BOOKING_HTTP_PORT", "8080"),
+		GRPCPort:    env("BOOKING_GRPC_PORT", "9092"),
+		RedisAddr:   env("BOOKING_REDIS_ADDR", "redis:6379"),
+		HoldTTL:     10 * time.Minute,
 
 		PaymentAddr:       env("BOOKING_PAYMENT_ADDR", "payment:9093"),
 		PaymentTimeout:    3 * time.Second,
@@ -69,9 +77,6 @@ func Load() (Config, error) {
 	}
 	var err error
 	if cfg.HoldTTL, err = duration("BOOKING_HOLD_TTL", cfg.HoldTTL); err != nil {
-		return Config{}, err
-	}
-	if cfg.SweepInterval, err = duration("BOOKING_SWEEP_INTERVAL", cfg.SweepInterval); err != nil {
 		return Config{}, err
 	}
 	if cfg.PaymentTimeout, err = duration("BOOKING_PAYMENT_TIMEOUT", cfg.PaymentTimeout); err != nil {
@@ -91,9 +96,18 @@ func Load() (Config, error) {
 	}
 	if cfg.ReconcileInterval >= cfg.HoldTTL {
 		// A reconciliation job that runs less often than holds expire is not a
-		// backstop, it is a seat leak: nothing else will ever release these
-		// reservations.
+		// backstop: it is what keeps the holds of a possibly-paid customer
+		// alive, so running it slower than the TTL means those seats lapse
+		// before it ever looks at them (D8).
 		return Config{}, fmt.Errorf("BOOKING_RECONCILE_INTERVAL (%s) must be shorter than BOOKING_HOLD_TTL (%s)", cfg.ReconcileInterval, cfg.HoldTTL)
+	}
+	if cfg.ReconcileGrace <= cfg.PaymentTimeout {
+		// The grace period is how long reconciliation waits before trusting a
+		// "no charge" answer it released seats on. A charge started just before
+		// that release takes up to one payment call to reach Payment, and a
+		// recheck that looks sooner can miss it: a paid customer, no seat, and
+		// nothing left that knows to refund them.
+		return Config{}, fmt.Errorf("BOOKING_RECONCILE_GRACE (%s) must be longer than BOOKING_PAYMENT_TIMEOUT (%s)", cfg.ReconcileGrace, cfg.PaymentTimeout)
 	}
 	return cfg, nil
 }

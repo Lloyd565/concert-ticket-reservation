@@ -1,45 +1,37 @@
 -- Every query here is hand-written SQL compiled by sqlc into type-safe Go.
 -- There is no ORM by design (AGENTS.md §2 rule 4): the locking semantics below
 -- are the correctness core of this service and must be readable as SQL.
+--
+-- P3 moved the hold out of this file. A hold is a Redis key with a TTL now
+-- (repository/redis), so nothing here claims a seat; what is left is the
+-- catalog, the reservation record, and the confirmation - the states that have
+-- to outlive a Redis restart.
 
--- name: LockSeatsForUpdate :many
+-- name: GetSeatsForEvent :many
 --
--- THE locking query. This is where the double-booking race is closed.
+-- Reads the requested seats' catalog rows: their prices, and whether they have
+-- already been sold.
 --
--- FOR UPDATE takes a row-level write lock on every matched seat and holds it
--- until this transaction commits or rolls back. A concurrent transaction
--- running this same query against any of these rows blocks here rather than
--- reading a stale 'available' - which is precisely the check-then-act window
--- that would otherwise let two requests both believe a seat is free.
+-- No FOR UPDATE, and that is not an oversight. In P0 this query WAS the lock -
+-- the row lock it took is what closed the check-then-act race. In P3 the lock is
+-- the Redis SET NX the caller has already won before reaching here, so this is
+-- a read: do these seats exist, what do they cost, and is one of them booked?
 --
--- ORDER BY id makes the lock acquisition order deterministic (D5). Postgres
--- applies the row-locking step above the sort, so rows are locked in id order.
--- Every transaction in the system therefore walks contended rows in the same
--- sequence and a waiting cycle - a deadlock - cannot form.
-SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until, price_cents
+-- The caller runs it AFTER taking the Redis claim, never before. Confirmation
+-- commits the booked row and only then deletes the Redis key, so a claim won
+-- after that delete is guaranteed to see 'booked' here. Reading first would
+-- reopen exactly the window that ordering closes.
+SELECT id, event_id, section, "row", number, status, price_cents
 FROM seats
 WHERE event_id = $1
   AND id = ANY (@seat_ids::uuid[])
-ORDER BY id
-FOR UPDATE;
-
--- name: MarkSeatsHeld :execrows
---
--- The 'act' half of the check-then-act pair. Safe only because the caller is
--- inside the transaction that already locked these rows above. The redundant
--- status = 'available' predicate is a tripwire: the caller compares the
--- affected row count against the number of seats requested, so if the lock
--- were ever missing the mismatch surfaces as an error instead of a silent
--- partial hold.
-UPDATE seats
-SET status              = 'held',
-    held_by_reservation = @reservation_id,
-    held_until          = @held_until
-WHERE id = ANY (@seat_ids::uuid[])
-  AND status = 'available';
+ORDER BY id;
 
 -- name: ListSeatsByEvent :many
-SELECT id, event_id, section, "row", number, status, held_by_reservation, held_until, price_cents
+--
+-- The catalog view: available or booked. A seat held by somebody's open
+-- checkout still reads 'available' here, because that fact lives in Redis.
+SELECT id, event_id, section, "row", number, status, price_cents
 FROM seats
 WHERE event_id = $1
 ORDER BY section, "row", number;
@@ -64,48 +56,14 @@ ORDER BY seat_id;
 
 -- name: AttachSeatsToReservation :exec
 --
--- One round trip for N seats. The partial unique index one_active_claim_per_seat
--- rejects this insert if any seat already has a live claim (D13 backstop).
+-- Records which seats this reservation is for. One round trip for N seats.
+--
+-- These rows are not the claim on the seat - the Redis key is - so this cannot
+-- trip the D13 index and does not try to. It exists because confirmation has to
+-- know which seats to book, and Redis cannot answer that: its keys map seat to
+-- reservation, never the reverse.
 INSERT INTO reservation_seats (reservation_id, seat_id)
 SELECT @reservation_id, unnest(@seat_ids::uuid[]);
-
--- name: ReleaseExpiredHolds :execrows
---
--- The P0 expiry mechanism (ARCHITECTURE.md §5.2). One statement, so the three
--- writes commit together: a reservation can never be marked expired while its
--- seats stay held, or vice versa.
---
--- Chained CTEs run in a single snapshot: expire the pending reservations whose
--- checkout window closed, stamp their claims released (which frees the D13
--- index for the next holder), then return exactly those seats to available.
---
--- payment_pending_since IS NULL is the D8 guard added in P2, and it is not
--- optional. A reservation whose payment outcome is unknown may already have
--- been charged; releasing its seats here would sell a seat the customer has
--- paid for - the exact mistake D8 forbids, reached through the sweeper rather
--- than through the saga. Those rows belong to the reconciliation job alone.
-WITH expired AS (
-    UPDATE reservations
-    SET status = 'expired'
-    WHERE status = 'pending'
-      AND expires_at <= now()
-      AND payment_pending_since IS NULL
-    RETURNING id
-), released AS (
-    UPDATE reservation_seats rs
-    SET released_at = now()
-    FROM expired e
-    WHERE rs.reservation_id = e.id
-      AND rs.released_at IS NULL
-    RETURNING rs.seat_id
-)
-UPDATE seats s
-SET status              = 'available',
-    held_by_reservation = NULL,
-    held_until          = NULL
-FROM released r
-WHERE s.id = r.seat_id
-  AND s.status = 'held';
 
 -- name: CreateEvent :exec
 INSERT INTO events (id, name, starts_at)
@@ -131,10 +89,10 @@ VALUES ($1, $2, $3, $4, $5, $6);
 -- Takes the reservation write lock and re-reads its state under it.
 --
 -- Re-reading is the point. Between the payment call and this transaction the
--- sweeper may have expired the reservation, or a concurrent retry may have
--- confirmed it. The status read here is what the decision is made on; the
--- status the caller remembered from before the network hop is stale by
--- definition.
+-- Redis hold may have expired and the seats gone to somebody else, or a
+-- concurrent retry may have confirmed it. The status read here is what the
+-- decision is made on; the status the caller remembered from before the network
+-- hop is stale by definition.
 SELECT id, user_id, event_id, status, total_cents, expires_at, idempotency_key, created_at, payment_pending_since
 FROM reservations
 WHERE id = $1
@@ -147,10 +105,15 @@ WHERE id = $1;
 
 -- name: LockSeatsByReservation :many
 --
--- Locks every seat this reservation claims, in seat-ID order (D5). Same
--- ordering rule as the hold path, so a confirm, a release and a hold all walk
--- contended seat rows in the same sequence and no cycle can form between them.
-SELECT s.id, s.event_id, s.section, s."row", s.number, s.status, s.held_by_reservation, s.held_until, s.price_cents
+-- THE locking query in P3. Confirmation is where a transient Redis hold becomes
+-- a permanent Postgres fact, so it is where Postgres has to be certain, and FOR
+-- UPDATE is what makes it so: two reservations that both believe they hold this
+-- seat - because a hold expired and was re-taken while a charge was in flight -
+-- queue here instead of both reading 'available'.
+--
+-- ORDER BY s.id (D5), so the confirm and refund paths walk contended rows in the
+-- same sequence and no waiting cycle can form between them.
+SELECT s.id, s.event_id, s.section, s."row", s.number, s.status, s.price_cents
 FROM seats s
 JOIN reservation_seats rs ON rs.seat_id = s.id
 WHERE rs.reservation_id = $1
@@ -160,43 +123,45 @@ FOR UPDATE OF s;
 
 -- name: MarkSeatsBooked :execrows
 --
--- held -> booked. The hold metadata is cleared because a booked seat is claimed
--- permanently rather than until a deadline, and the seats_hold_metadata_consistent
--- constraint requires exactly that. status = 'held' is a tripwire: the caller
--- compares the row count against the seats it locked, so a seat that moved
--- underneath the transaction surfaces as an error, not a partial booking.
-UPDATE seats
-SET status              = 'booked',
-    held_by_reservation = NULL,
-    held_until          = NULL
-WHERE held_by_reservation = @reservation_id
-  AND status = 'held';
-
--- name: ReleaseReservationSeats :execrows
+-- available -> booked, with the claim stamped confirmed at the same instant, in
+-- one statement so the seat row and the D13 index can never disagree about who
+-- owns the seat.
 --
--- held -> available, with the claim stamped released so the D13 partial unique
--- index frees up for the next holder. One statement, so a claim can never be
--- stamped released while its seat stays held.
-WITH released AS (
+-- status = 'available' is the tripwire the caller counts against the seats it
+-- locked above: if another reservation booked this seat first, the count comes
+-- back short and confirmation fails rather than silently overwriting a sale.
+WITH confirmed AS (
     UPDATE reservation_seats rs
-    SET released_at = now()
+    SET confirmed_at = now()
     WHERE rs.reservation_id = @reservation_id
       AND rs.released_at IS NULL
     RETURNING rs.seat_id
 )
 UPDATE seats s
-SET status              = 'available',
-    held_by_reservation = NULL,
-    held_until          = NULL
-FROM released r
-WHERE s.id = r.seat_id
-  AND s.status = 'held';
+SET status = 'booked'
+FROM confirmed c
+WHERE s.id = c.seat_id
+  AND s.status = 'available';
+
+-- name: ReleaseReservationClaims :execrows
+--
+-- Settles an unconfirmed reservation's claim rows without touching a seat -
+-- because in P3 an unconfirmed claim never owned the seat in the first place;
+-- the Redis key did, and the caller deletes that separately.
+--
+-- Bookkeeping, not compensation. It is what makes "this reservation is over"
+-- legible in the database rather than only in Redis's absence.
+UPDATE reservation_seats
+SET released_at = now()
+WHERE reservation_id = @reservation_id
+  AND released_at IS NULL
+  AND confirmed_at IS NULL;
 
 -- name: ReleaseBookedSeats :execrows
 --
--- booked -> available, for a refund. Kept separate from ReleaseReservationSeats
--- because the state it moves from is different, and one statement accepting
--- either would happily release a seat from a state nobody intended.
+-- booked -> available, for a refund, with the claim stamped released so the D13
+-- index frees up for the next buyer. One statement, so a claim can never be
+-- stamped released while its seat stays booked.
 WITH released AS (
     UPDATE reservation_seats rs
     SET released_at = now()
@@ -205,9 +170,7 @@ WITH released AS (
     RETURNING rs.seat_id
 )
 UPDATE seats s
-SET status              = 'available',
-    held_by_reservation = NULL,
-    held_until          = NULL
+SET status = 'available'
 FROM released r
 WHERE s.id = r.seat_id
   AND s.status = 'booked';
@@ -228,17 +191,28 @@ WHERE id = @id
 -- name: MarkPaymentPending :execrows
 --
 -- Hands the reservation to the reconciliation job (D8). Until this is cleared,
--- neither the sweeper nor anything else may release these seats: a charge may
--- exist for them and nobody yet knows its outcome.
+-- nothing else may release these seats: a charge may exist for them and nobody
+-- yet knows its outcome.
 --
--- Idempotent by construction. The first unknown outcome is the one that
--- matters, so a repeat leaves the original timestamp alone rather than pushing
--- the reconciliation grace period further into the future.
+-- In P0 this column also told the sweeper to keep its hands off. There is no
+-- sweeper now, so this is only half of D8 - the caller must also push the Redis
+-- TTL out, or the hold simply expires and the seats go back on sale under a
+-- charge that may have succeeded. See Saga.LeavePendingForReconciliation.
+--
+-- It is also the fence in front of every charge. The row count says whether the
+-- reservation was still pending at this instant, and the saga calls Payment only
+-- if it was. Once a release commits no new charge can start for it, so any
+-- charge a release missed was already under way - which is what bounds how long
+-- reconciliation waits before rechecking (migration 000004).
+--
+-- Idempotent by construction. The first mark is the one that matters, so a
+-- repeat keeps the original timestamp rather than pushing the reconciliation
+-- grace period further into the future - and still counts the row, because the
+-- fence is about the status, not about who marked first.
 UPDATE reservations
-SET payment_pending_since = now()
+SET payment_pending_since = COALESCE(payment_pending_since, now())
 WHERE id = @id
-  AND status = 'pending'
-  AND payment_pending_since IS NULL;
+  AND status = 'pending';
 
 -- name: ListReservationsAwaitingReconciliation :many
 --
@@ -254,6 +228,31 @@ WHERE status = 'pending'
   AND payment_pending_since <= @older_than
 ORDER BY payment_pending_since
 LIMIT @row_limit;
+
+-- name: QueueChargeRecheck :exec
+--
+-- Queues a reservation just released on "no charge" evidence for one more look
+-- (migration 000004). Runs in the release's transaction: a release that commits
+-- without it is exactly the orphan the table exists to prevent.
+INSERT INTO charge_rechecks (reservation_id)
+VALUES (@reservation_id)
+ON CONFLICT (reservation_id) DO NOTHING;
+
+-- name: ListReservationsAwaitingChargeRecheck :many
+--
+-- Released reservations whose release is older than the grace period: long
+-- enough ago that a charge started before the release has reached Payment, if
+-- it ever will. Oldest first, and limited, like the reconciliation scan.
+SELECT r.id, r.user_id, r.event_id, r.status, r.total_cents, r.expires_at, r.idempotency_key, r.created_at, r.payment_pending_since
+FROM charge_rechecks c
+JOIN reservations r ON r.id = c.reservation_id
+WHERE c.released_at <= @older_than
+ORDER BY c.released_at
+LIMIT @row_limit;
+
+-- name: ClearChargeRecheck :exec
+DELETE FROM charge_rechecks
+WHERE reservation_id = @reservation_id;
 
 -- name: CreateBooking :exec
 --

@@ -25,15 +25,25 @@ var (
 	// ErrInvalidInput marks a caller mistake - a malformed ID, a missing
 	// required field - so the boundary can answer 400 instead of 500.
 	ErrInvalidInput = errors.New("invalid input")
+
+	// ErrHoldsUnavailable is D12 in error form: the hold store cannot be
+	// reached, so no seat can be claimed safely.
+	//
+	// It is deliberately not ErrSeatUnavailable. The seats may be perfectly
+	// free; what is missing is the only mechanism that can hand exactly one of
+	// them to exactly one caller. The correct answer is 503 and a retry, never
+	// a fallback to an unlocked path - a hold taken without the lock is a
+	// double-booking waiting for a second caller (D12, AGENTS.md §2 rule 11).
+	ErrHoldsUnavailable = errors.New("hold store unavailable; refusing to claim seats without a lock")
 )
 
 // ErrBackstopTripped means the database-level backstop (D13, the partial unique
-// index on reservation_seats) refused a second active claim on a seat.
+// index on reservation_seats) refused a second confirmed claim on a seat.
 //
 // The outcome is still correct for the caller - it wraps ErrSeatUnavailable, so
-// the boundary answers 409 - but reaching it means the application-level
-// SELECT ... FOR UPDATE path failed to do its job. Tests assert this never
-// happens; production should alert on it.
+// the boundary answers 409 - but reaching it means the Redis claim path and the
+// SELECT ... FOR UPDATE in confirmation both failed to do their job. Tests
+// assert this never happens; production should alert on it.
 var ErrBackstopTripped = fmt.Errorf("claim backstop tripped: %w", ErrSeatUnavailable)
 
 // TransitionError reports an attempt to move an entity between two states that

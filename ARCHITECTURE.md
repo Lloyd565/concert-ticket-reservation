@@ -227,19 +227,40 @@ Expiry in P0 is handled by a background sweeper that releases seats where `held_
 
 **Hard constraint: the transaction must not span an external call.** Claim, commit, release the lock — *then* call the payment service. A lock held across a network call is how you turn a 5 ms transaction into a 5 s one under load.
 
-**Phase P3 — Redis holds with TTL**
+**Phase P3 — Redis holds with TTL (built)**
 
-The timestamp-column approach has two limits: expiry accuracy is bounded by sweeper interval, and the sweeper adds load that grows with hold volume. Redis replaces it:
+The timestamp-column approach has two limits, and the second is the one that blocks replication: expiry accuracy is bounded by the sweeper interval, and the sweeper adds load that grows with hold volume. Worse, *somebody* has to run it — which makes a second Booking replica a question rather than a shrug. Redis replaces it:
 
 ```
 SET seat:hold:{event_id}:{seat_id} {reservation_id} NX EX 600
 ```
 
-`NX` makes the claim itself atomic (set only if absent — this *is* the lock). `EX 600` makes abandonment self-healing with no sweeper.
+`NX` makes the claim itself atomic (set only if absent — this *is* the lock). `EX 600` makes abandonment self-healing with no sweeper, no ticker, and no replica having to be the one that owns expiry. That is what makes Booking replicable: two replicas share one Redis and one Postgres and coordinate through nothing else.
 
-For multi-seat atomicity, use a **Lua script** so the all-or-nothing check runs atomically inside Redis: attempt all keys, and if any fails, release the ones already taken and return failure.
+**Multi-seat holds run as a Lua script** (`services/booking/internal/repository/redis/holds.go`). Redis executes a script to completion with nothing interleaved, so the loop of `SET NX`s and the rollback that undoes them are one indivisible step. Issuing the same commands one at a time from Go would not be: between two round trips another caller can take the seat the first round trip did not reach yet, and the "release what we already took" path becomes a second window in which somebody else's key can be deleted. See §5.2.1.
 
-Postgres remains the source of truth for *confirmed* bookings. Redis holds transient state only. On confirmation: write the booking to Postgres in a transaction, then delete the Redis key.
+**What lives where.** Postgres is the source of truth for *confirmed* bookings; Redis holds transient state only. The `seats` row therefore has two states, `available` and `booked` — `held` is not representable, deliberately, because a hold recorded in Postgres is a hold nothing expires without a sweeper. On confirmation: write the booking to Postgres in one transaction, then delete the Redis key.
+
+The ordering of the two stores is load-bearing in both directions:
+
+- **Holding** claims the Redis key *first*, then reads the seat catalog. Confirmation commits `booked` and only then deletes the key, so a claim won just after that delete is guaranteed to read `booked`. Reading first and claiming second would reopen exactly that window.
+- **Confirming** checks that the reservation still owns its keys *before* opening the transaction (a network call may not happen inside one — D4), then takes `SELECT ... FOR UPDATE` on the seats. The Redis check is what replaces P0's "the sweeper already released these seats"; the row lock is what actually keeps the invariant if that check goes stale.
+
+**Fail closed (D12).** Every method on the hold store returns `domain.ErrHoldsUnavailable` when Redis cannot be reached, and there is no fallback path to Postgres locking. A hold taken without the lock is a double-booking waiting for its second customer. Readiness fails too, so a replica that cannot claim seats leaves the rotation rather than answering 503 to every request.
+
+**D8 against a TTL.** Retiring the sweeper does not retire the second way to violate D8, it changes who carries it — see §6.2.
+
+**D13 restated.** The backstop index used to mean "one live claim per seat", which cannot survive here: an abandoned hold expires in Redis with no writer left to stamp its Postgres claim released, so a stale claim would block the seat forever. It is now `UNIQUE (seat_id) WHERE confirmed_at IS NOT NULL AND released_at IS NULL` — one *confirmed* claim per seat, which is the invariant word for word. Unconfirmed claims are inert.
+
+#### 5.2.1 Why a Lua script and not three round trips
+
+A three-seat hold issued as separate commands is three separate moments, and both of the failure modes it introduces are silent.
+
+Take two callers wanting seats {A, B} and {B, C}. Caller 1 takes A. Caller 2 takes B. Caller 1 tries B and fails. Caller 2 tries C and succeeds. Caller 1 must now roll back, releasing A — which is correct — but the interleaving has already produced a partial hold that existed, was visible to everyone, and briefly made A unavailable to a caller who would have got it. With enough contention on a popular row, two callers can also fail each other's second seat and both roll back, leaving neither with seats that were free the whole time: livelock, not deadlock, and it does not show up as an error anywhere.
+
+The rollback itself is the sharper problem. Between caller 1 failing on B and caller 1 deleting A, the TTL on A can expire and caller 3 can claim it. Caller 1's `DEL A` then deletes caller 3's hold, and caller 3 walks to checkout holding a seat the store no longer believes is theirs — which a fourth caller can now take. A compare-then-delete from the application does not fix it either; the compare and the delete are themselves two round trips with the same gap between them.
+
+Inside a script both disappear, because there is no "between". Redis runs the script to completion single-threaded: no other client observes A held while B is being attempted, no other client can take A during the rollback, and the whole claim is one atomic decision — which is what D6 asks for and what a sequence of round trips cannot give.
 
 **Why not optimistic locking?** A version-column approach suits low contention spread across many rows. Ticketing is the opposite: thousands of users contend for the same handful of good seats. Optimistic locking would produce a high retry-failure rate exactly when it matters most. It is the wrong tool for this access pattern.
 
@@ -251,7 +272,7 @@ available ──hold──> held ──confirm──> booked ──refund──>
     └──expire/release─┘
 ```
 
-Transitions are validated in the domain layer. Illegal transitions raise a domain error, never a silent no-op.
+Since P3 the `held` state lives in Redis, not on the seat row: `hold`, `expire` and `release` are writes to a key, and the Postgres row moves straight from `available` to `booked` when a hold is redeemed. The `domain.Seat` state machine models the row, so it has the two states the row has. Illegal transitions raise a domain error, never a silent no-op.
 
 ## 6. Reservation Saga
 
@@ -272,14 +293,22 @@ The reservation → payment → confirmation sequence spans Booking and Payment.
 | Failure point | Compensating action |
 |---|---|
 | Payment declined | Release seats → `available`, reservation → `failed`, publish `payment.failed` |
-| Payment call times out (result unknown) | Leave reservation `pending`; reconciliation job queries Payment by idempotency key. If charged → complete confirmation. If not → release seats. **Never blind-release on timeout** — the charge may have succeeded |
-| Hold expires before payment | Sweeper/TTL releases seats, reservation → `expired`, publish `reservation.expired` |
+| Payment call times out (result unknown) | Leave reservation `pending` — it was marked for reconciliation before the call, so this holds even if Booking dies mid-call; reconciliation job queries Payment by idempotency key. If charged → complete confirmation. If not → release seats. **Never blind-release on timeout** — the charge may have succeeded |
+| Hold expires before payment | The Redis TTL releases the seats, unaided. The reservation is left `pending` with a deadline in the past: expiry is a fact about the clock, derivable by anyone who asks, and the saga refuses to charge against it (FR-4.2). Rewriting the row would need a job scanning for closed windows — which is the sweeper, under a new name |
 | Payment succeeded but confirmation write fails | Reservation stays `pending`; reconciliation retries confirmation. If unrecoverable → automatic refund. Satisfies FR-5.3: never a paid-but-unbooked customer |
 | Refund requested on confirmed booking | Payment refunds → publishes `refund.completed` → Booking releases seats, booking → `refunded` |
 
-Each row is a separate named function in `services/booking/internal/usecase/saga.go`, not a branch of one handler: `ReleaseDeclined`, `LeavePendingForReconciliation`, the P0 `Sweeper`, `RefundUnconfirmable`, `ReleaseRefunded`. Row 5's *trigger* is the `refund.completed` event and arrives with the broker in P4; its action half is built in P2 because row 4 is unfinished without it.
+Each row is a separate named function in `services/booking/internal/usecase/saga.go`, not a branch of one handler: `ReleaseDeclined`, `LeavePendingForReconciliation`, `RefundUnconfirmable`, `ReleaseRefunded`. Row 3 has no function at all any more — it is the Redis TTL. Row 5's *trigger* is the `refund.completed` event and arrives with the broker in P4; its action half is built in P2 because row 4 is unfinished without it.
 
-**The second way to violate D8.** The saga leaving a timed-out reservation `pending` is only half the rule. The P0 sweeper releases any `pending` reservation past `expires_at`, and from its point of view one of these is just an abandoned checkout — so left alone it would blind-release the seats ten minutes later, through a different code path. `reservations.payment_pending_since` marks a reservation whose payment outcome is unknown, and `ReleaseExpiredHolds` skips every row that carries it. Reconciliation is then the only owner of those seats, which is why its interval must stay well inside the hold TTL; Booking refuses to start if it does not.
+**The second way to violate D8.** The saga leaving a timed-out reservation `pending` is only half the rule, and the other half changed shape in P3.
+
+In P0 the danger was the sweeper: it released any `pending` reservation past `expires_at`, and from its point of view one of these was just an abandoned checkout, so left alone it would blind-release the seats ten minutes later through a different code path. The guard was a `WHERE` clause — `reservations.payment_pending_since IS NULL` — in one query.
+
+Retiring the sweeper does not retire the danger. The Redis TTL now does exactly what the sweeper did, and there is no `WHERE` clause to add to it: it is not running any SQL and nobody asks it anything. So the guard has to be an *action* rather than a condition. `Saga.KeepHold` pushes the hold out by another checkout window — once when the outcome first becomes unknown, and again on every reconciliation pass that fails to resolve it, because one extension is good for one window and the case this exists for is Payment being unreachable for longer than that. `reservations.payment_pending_since` still marks the reservation, and reconciliation is still the only owner of those seats, which is why its interval must stay well inside the hold TTL; Booking refuses to start if it does not.
+
+Deleting that extension is a one-line change that breaks nothing visible and sells a paid customer's seat ten minutes later, so it has a test of its own (`TestHoldIsKeptAliveWhileThePaymentOutcomeIsUnknown`).
+
+**A charge that succeeded but could not be confirmed** — the database was briefly unreachable, Redis was, the seats had already gone — is handed to reconciliation rather than returned as an error nobody follows up. There is a charge with no delivery, and reconciliation is the only component that resolves that: it asks Payment, gets `succeeded`, retries the confirm, and refunds if confirmation is genuinely impossible (row 4, FR-5.3).
 
 ### 6.3 Reconciliation job
 
@@ -293,14 +322,20 @@ Payment answers with one of four things, each with exactly one correct action:
 |---|---|
 | `succeeded` | Confirm. If confirmation is impossible, refund (§6.2 row 4) |
 | `declined` / `failed` | Release the seats, reservation → `failed` (§6.2 row 1, resolved late) |
-| no charge under this key | Release the seats. The only evidence that makes releasing safe after a timeout |
+| no charge under this key | Release the seats — the only evidence that makes releasing safe after a timeout — and queue the reservation to be asked about once more after the grace period; a charge found then is refunded (see below) |
 | `pending` | Payment holds a charge it never settled. **Re-drive it** under the same key, which settles it into one of the three above |
 
-The last row is what makes the job converge rather than poll. A charge left `pending` — Payment wrote the row, then its own provider call was interrupted — is not going to settle on its own: nothing else re-drives it, the sweeper is forbidden to touch the reservation, and the customer is left with a hold that never resolves. So reconciliation calls `Charge` again rather than only `GetCharge`. Payment resumes the existing charge instead of creating a second one and passes the same key to the provider, so no money moves twice (FR-4.5).
+The last row is what makes the job converge rather than poll. A charge left `pending` — Payment wrote the row, then its own provider call was interrupted — is not going to settle on its own: nothing else re-drives it, nothing else may release the reservation, and the customer is left with a hold that never resolves. So reconciliation calls `Charge` again rather than only `GetCharge`. Payment resumes the existing charge instead of creating a second one and passes the same key to the provider, so no money moves twice (FR-4.5).
 
-**Compensation runs on a detached context.** Everything the saga writes after the payment call — the reconciliation mark, the confirmation, the release — uses `context.WithoutCancel` with its own deadline. The moment those writes are most likely to be skipped is when the request context has already been cancelled (the gateway's deadline fired, the customer closed the tab), which is exactly the moment a charge is most likely to be in flight. Inheriting that cancellation leaves the reservation pending with nothing marking it, and the sweeper then releases seats that may have been paid for: D8 violated by way of a context, with no code path that looks wrong.
+**Compensation runs on a detached context.** Everything the saga writes after the payment call — the reconciliation mark, the confirmation, the release — uses `context.WithoutCancel` with its own deadline. The moment those writes are most likely to be skipped is when the request context has already been cancelled (the gateway's deadline fired, the customer closed the tab), which is exactly the moment a charge is most likely to be in flight. Inheriting that cancellation leaves the reservation pending with nothing marking it and its hold never extended, and the TTL then releases seats that may have been paid for: D8 violated by way of a context, with no code path that looks wrong.
 
-**Deadlines nest.** `BOOKING_PAYMENT_TIMEOUT` (3s) sits inside `GATEWAY_UPSTREAM_TIMEOUT` (5s). If the gateway gives up first, the customer gets a 504 instead of the `202 Accepted` that tells them the payment is still settling for a reservation that is alive and being reconciled.
+**The mark is written before the call, not after it fails.** A mark written in response to a failed call needs Booking to survive the call. If Booking dies mid-call nothing marks the reservation, this job never scans it, and once the window closes the saga refuses the customer's retry (FR-4.2): a charge that went through is never delivered and never refunded. Marked first, a crash anywhere after the mark leaves a reservation this job will find, and a mark that cannot be written stops the call.
+
+**"No charge" is asked twice.** Payment's "no charge under this key" is true when it is said. A pay retry already past the mark can reach Payment after the job has released the seats on that answer, and take the money for a reservation that is now `failed` — which the pending-only scan never looks at again. Two things close it. The mark is a fence: it counts the row only while the reservation is `pending`, and the saga calls Payment only if it did, so no charge can start after a release commits. And that release queues the reservation in `charge_rechecks` in the same transaction; once the grace period has passed — longer than one payment call, which Booking refuses to start without — the job asks again. A charge found then is refunded (§6.2 row 4), a `pending` one is re-driven first, and none found closes the entry. Only the "no charge" release is queued: a declined or failed key is settled for good, and Payment answers every later charge under it from that row.
+
+Payment applies the detached-context rule one layer down: once the provider has answered, the settle write ignores the caller's cancellation. Otherwise a caller giving up a moment too early turns a recorded approval into a `pending` row that only a re-drive — and the provider's replay of its key — can recover.
+
+**Deadlines nest.** `PAYMENT_PROVIDER_TIMEOUT` (1s) is per attempt, and both attempts plus backoff sit inside `BOOKING_PAYMENT_TIMEOUT` (3s), which gRPC carries into Payment — at 3s per attempt the first attempt used the whole deadline and the retry never ran. `BOOKING_PAYMENT_TIMEOUT` in turn sits inside `GATEWAY_UPSTREAM_TIMEOUT` (5s). If the gateway gives up first, the customer gets a 504 instead of the `202 Accepted` that tells them the payment is still settling for a reservation that is alive and being reconciled.
 
 ## 7. Tech stack
 
@@ -347,8 +382,10 @@ refresh_tokens (id, user_id, token_hash, expires_at, revoked_at)
 venues        (id, name, address)
 events        (id, venue_id, organizer_id, name, starts_at, on_sale_at, status)
 pricing_tiers (id, event_id, name, price_cents)
-seats         (id, event_id, section, row, number, tier_id, status,
-               held_by_reservation, held_until, version)
+seats         (id, event_id, section, row, number, tier_id, status)
+               -- status is available|booked. 'held' is a Redis key, not a
+               -- column: a hold recorded here is a hold nothing expires
+               -- without a sweeper (§5.2)
                UNIQUE (event_id, section, row, number)
 reservations  (id, user_id, event_id, status, total_cents,
                expires_at, idempotency_key UNIQUE, created_at,
@@ -356,14 +393,24 @@ reservations  (id, user_id, event_id, status, total_cents,
                                         -- unknown; while set, ONLY the
                                         -- reconciliation job may release
                                         -- these seats (D8)
-reservation_seats (reservation_id, seat_id)  PK(reservation_id, seat_id)
+reservation_seats (reservation_id, seat_id, confirmed_at, released_at)
+               PK(reservation_id, seat_id)
+               UNIQUE (seat_id) WHERE confirmed_at IS NOT NULL
+                                  AND released_at IS NULL   -- D13 backstop:
+               -- one CONFIRMED claim per seat, which is the invariant verbatim
 bookings      (id, reservation_id UNIQUE, user_id, payment_id,
                confirmed_at, status)
 tickets       (id, booking_id, seat_id, qr_code UNIQUE, issued_at)
 outbox        (id, aggregate_id, event_type, payload, created_at, published_at)
 ```
 
-Key constraints: a partial unique index enforcing at most one active (`held` or `booked`) claim per seat, as a database-level backstop to the application locking logic. Defense in depth — if the application logic is ever wrong, the database still refuses the double-booking.
+### redis
+```
+seat:hold:{event_id}:{seat_id} -> {reservation_id}   -- SET NX EX 600
+```
+The hold itself, not a cache of one. Lost on restart, which is safe and is why the container runs with no persistence: a hold is minutes of transient state, and Postgres owns every confirmed booking.
+
+Key constraints: the partial unique index on `reservation_seats` above, enforcing at most one **confirmed** claim per seat, as a database-level backstop to the Redis claim path. Defense in depth — if the application logic is ever wrong, the database still refuses the double-booking.
 
 ### payment_db
 ```
@@ -442,7 +489,7 @@ That is the whole of admin management. There is no promotion endpoint and no adm
 
 As of P2 that is: `postgres` (booking_db), `auth_db`, `payment_db`, `booking`, `auth`, `payment`, `gateway`. There are no `depends_on` edges between the four services — each waits only on its own database, the gateway waits on nothing because it dials its upstreams lazily, and Booking does not wait on Payment for the same reason. Starting them in any order, or starting the gateway with every upstream down, is a supported configuration and is the compose-level expression of §3.3. Booking with Payment down serves seat maps and holds normally; only the pay step reports an unknown outcome, and reconciliation resolves those once Payment returns.
 
-`PAYMENT_PROVIDER_MODE` (`succeed` | `decline` | `hang`) selects how the mock provider answers. `hang` is the interesting one: it produces the unknown outcome D8 exists for, in a running stack, and lets an operator watch seats stay held and the reconciliation job — not the sweeper — resolve them.
+`PAYMENT_PROVIDER_MODE` (`succeed` | `decline` | `hang`) selects how the mock provider answers. `hang` is the interesting one: it produces the unknown outcome D8 exists for, in a running stack, and lets an operator watch a hold's TTL get pushed out (`TTL seat:hold:...` in `redis-cli`) instead of lapsing, and the reconciliation job resolve it.
 
 Each service has its own Dockerfile and its own CI pipeline. Independent deployability is the entire justification for this architecture — if services can only be released together, the split has bought nothing.
 

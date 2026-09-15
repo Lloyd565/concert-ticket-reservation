@@ -26,9 +26,9 @@ BOOKING_DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/booking_db?s
 AUTH_DATABASE_URL ?= postgres://postgres:postgres@localhost:5433/auth_db?sslmode=disable
 PAYMENT_DATABASE_URL ?= postgres://postgres:postgres@localhost:5434/payment_db?sslmode=disable
 
-.PHONY: up down test test-integration test-concurrency test-saga lint migrate-up migrate-down proto sqlc
+.PHONY: up down test test-integration test-concurrency test-holds test-saga lint migrate-up migrate-down proto sqlc
 
-up:                     ## Start the local stack (P2: postgres, auth_db, payment_db, booking, auth, payment, gateway) and migrate
+up:                     ## Start the local stack (P3: postgres, auth_db, payment_db, redis, 2x booking, auth, payment, gateway) and migrate
 	docker compose up -d --build --wait
 	$(MAKE) migrate-up
 
@@ -41,11 +41,14 @@ test:                   ## Unit tests (no infrastructure), all modules
 test-integration:       ## Integration tests against real Postgres (testcontainers; needs Docker)
 	@for m in $(INTEGRATION_MODULES); do echo "== $$m"; (cd $$m && go test -tags=integration -count=1 ./...) || exit 1; done
 
-test-concurrency:       ## THE critical test: 64 parallel holds on one seat, exactly one wins
+test-concurrency:       ## THE critical test: 64 parallel holds on one seat across 2 Booking replicas, exactly one wins
 	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestHoldSeatsConcurrent' ./internal/usecase/...
 
+test-holds:             ## P3 hold mechanics: TTL expiry with no sweeper, and failing closed when Redis dies
+	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestAbandonedHoldExpiresWithItsTTL|TestHoldsFailClosedWhenRedisIsGone' ./internal/usecase/...
+
 test-saga:              ## Saga compensation paths, including a forced payment timeout and a forced decline
-	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestPay|TestReconcile|TestSweeper' ./internal/usecase/...
+	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestPay|TestReconcile|TestCompensation|TestHoldIsKeptAlive' ./internal/usecase/...
 	cd $(PAYMENT) && go test -tags=integration -count=1 -v -run 'TestCharge|TestRefund|TestGetCharge|TestConcurrent' ./internal/usecase/...
 
 lint:                   ## golangci-lint, all modules

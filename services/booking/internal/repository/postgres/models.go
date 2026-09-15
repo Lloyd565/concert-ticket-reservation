@@ -19,6 +19,11 @@ type Booking struct {
 	ConfirmedAt   time.Time
 }
 
+type ChargeRecheck struct {
+	ReservationID uuid.UUID
+	ReleasedAt    time.Time
+}
+
 type Event struct {
 	ID        uuid.UUID
 	Name      string
@@ -42,19 +47,18 @@ type ReservationSeat struct {
 	ReservationID uuid.UUID
 	SeatID        uuid.UUID
 	ReleasedAt    *time.Time
+	ConfirmedAt   *time.Time
 }
 
 type Seat struct {
-	ID                uuid.UUID
-	EventID           uuid.UUID
-	Section           string
-	Row               string
-	Number            string
-	Status            string
-	HeldByReservation *uuid.UUID
-	HeldUntil         *time.Time
-	CreatedAt         time.Time
-	PriceCents        int64
+	ID         uuid.UUID
+	EventID    uuid.UUID
+	Section    string
+	Row        string
+	Number     string
+	Status     string
+	CreatedAt  time.Time
+	PriceCents int64
 }
 
 type Ticket struct {
