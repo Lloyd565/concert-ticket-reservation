@@ -9,10 +9,11 @@ BOOKING := services/booking
 AUTH    := services/auth
 GATEWAY := services/gateway
 PAYMENT := services/payment
+NOTIFICATION := services/notification
 # Every Go module in the repo, so `test` and `lint` cannot silently skip one.
-MODULES := $(BOOKING) $(AUTH) $(GATEWAY) $(PAYMENT) proto
+MODULES := $(BOOKING) $(AUTH) $(GATEWAY) $(PAYMENT) $(NOTIFICATION) proto
 # Modules with integration tests, which need Docker for testcontainers.
-INTEGRATION_MODULES := $(BOOKING) $(AUTH) $(PAYMENT)
+INTEGRATION_MODULES := $(BOOKING) $(AUTH) $(PAYMENT) $(NOTIFICATION)
 
 MIGRATE := go run -tags postgres github.com/golang-migrate/migrate/v4/cmd/migrate@v4.18.1
 BUF     := go run github.com/bufbuild/buf/cmd/buf@v1.57.2
@@ -25,10 +26,11 @@ endif
 BOOKING_DATABASE_URL ?= postgres://postgres:postgres@localhost:5432/booking_db?sslmode=disable
 AUTH_DATABASE_URL ?= postgres://postgres:postgres@localhost:5433/auth_db?sslmode=disable
 PAYMENT_DATABASE_URL ?= postgres://postgres:postgres@localhost:5434/payment_db?sslmode=disable
+NOTIFICATION_DATABASE_URL ?= postgres://postgres:postgres@localhost:5436/notif_db?sslmode=disable
 
-.PHONY: up down test test-integration test-concurrency test-holds test-saga lint migrate-up migrate-down proto sqlc
+.PHONY: up down test test-integration test-concurrency test-holds test-saga test-events lint migrate-up migrate-down proto sqlc
 
-up:                     ## Start the local stack (P3: postgres, auth_db, payment_db, redis, 2x booking, auth, payment, gateway) and migrate
+up:                     ## Start the local stack (P4: 4 databases, redis, rabbitmq, 2x booking, auth, payment, notification, gateway) and migrate
 	docker compose up -d --build --wait
 	$(MAKE) migrate-up
 
@@ -51,18 +53,27 @@ test-saga:              ## Saga compensation paths, including a forced payment t
 	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestPay|TestReconcile|TestCompensation|TestHoldIsKeptAlive' ./internal/usecase/...
 	cd $(PAYMENT) && go test -tags=integration -count=1 -v -run 'TestCharge|TestRefund|TestGetCharge|TestConcurrent' ./internal/usecase/...
 
+test-events:            ## P4: events commit with their state change, the relay publishes with confirms, and a replayed event sends one email
+	cd $(BOOKING) && go test -tags=integration -count=1 -v -run 'TestOutbox|TestExpirer' ./internal/usecase/...
+	cd $(BOOKING) && go test -tags=integration -count=1 -v ./internal/events/...
+	cd $(PAYMENT) && go test -tags=integration -count=1 -v -run 'TestOutbox' ./internal/usecase/...
+	cd $(PAYMENT) && go test -tags=integration -count=1 -v ./internal/events/...
+	cd $(NOTIFICATION) && go test -tags=integration -count=1 -v ./internal/events/...
+
 lint:                   ## golangci-lint, all modules
 	@for m in $(MODULES); do echo "== $$m"; (cd $$m && golangci-lint run ./...) || exit 1; done
 
-migrate-up:             ## Apply migrations (booking, auth and payment)
+migrate-up:             ## Apply migrations (booking, auth, payment and notification)
 	cd $(BOOKING) && $(MIGRATE) -path migrations -database "$(BOOKING_DATABASE_URL)" up
 	cd $(AUTH) && $(MIGRATE) -path migrations -database "$(AUTH_DATABASE_URL)" up
 	cd $(PAYMENT) && $(MIGRATE) -path migrations -database "$(PAYMENT_DATABASE_URL)" up
+	cd $(NOTIFICATION) && $(MIGRATE) -path migrations -database "$(NOTIFICATION_DATABASE_URL)" up
 
 migrate-down:           ## Roll back the last migration of each service
 	cd $(BOOKING) && $(MIGRATE) -path migrations -database "$(BOOKING_DATABASE_URL)" down 1
 	cd $(AUTH) && $(MIGRATE) -path migrations -database "$(AUTH_DATABASE_URL)" down 1
 	cd $(PAYMENT) && $(MIGRATE) -path migrations -database "$(PAYMENT_DATABASE_URL)" down 1
+	cd $(NOTIFICATION) && $(MIGRATE) -path migrations -database "$(NOTIFICATION_DATABASE_URL)" down 1
 
 # buf carries its own protobuf compiler, so there is no protoc to install; the
 # two code-generator plugins are Go binaries and are installed on demand.
@@ -76,3 +87,4 @@ sqlc:                   ## Regenerate typed query code from queries.sql
 	cd $(BOOKING) && sqlc generate
 	cd $(AUTH) && sqlc generate
 	cd $(PAYMENT) && sqlc generate
+	cd $(NOTIFICATION) && sqlc generate
