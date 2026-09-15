@@ -35,16 +35,17 @@ type Holder struct {
 	holds        HoldStore
 	seats        SeatRepository
 	reservations ReservationRepository
+	outbox       Outbox
 	ttl          time.Duration
 	log          *slog.Logger
 }
 
 // NewHolder wires a Holder. A zero ttl falls back to DefaultHoldTTL.
-func NewHolder(tx TxManager, holds HoldStore, seats SeatRepository, reservations ReservationRepository, ttl time.Duration, log *slog.Logger) *Holder {
+func NewHolder(tx TxManager, holds HoldStore, seats SeatRepository, reservations ReservationRepository, outbox Outbox, ttl time.Duration, log *slog.Logger) *Holder {
 	if ttl <= 0 {
 		ttl = DefaultHoldTTL
 	}
-	return &Holder{tx: tx, holds: holds, seats: seats, reservations: reservations, ttl: ttl, log: log}
+	return &Holder{tx: tx, holds: holds, seats: seats, reservations: reservations, outbox: outbox, ttl: ttl, log: log}
 }
 
 // HoldSeats atomically claims every requested seat for userID, or claims none.
@@ -159,13 +160,25 @@ func (h *Holder) HoldSeats(ctx context.Context, eventID string, seatIDs []string
 	// ---- The record -------------------------------------------------------
 	//
 	// The seats are already ours; this is what makes the reservation legible to
-	// the saga, to reconciliation and to the customer. The two rows commit
-	// together: a reservation whose seats nobody recorded cannot be confirmed.
+	// the saga, to reconciliation and to the customer. The rows commit together:
+	// a reservation whose seats nobody recorded cannot be confirmed, and one
+	// whose reservation.held was not recorded with it is one the event stream
+	// never hears about (D9).
 	err = h.tx.WithinTx(ctx, func(ctx context.Context) error {
 		if err := h.reservations.CreateReservation(ctx, res); err != nil {
 			return err
 		}
-		return h.reservations.AttachSeats(ctx, res.ID, requested)
+		if err := h.reservations.AttachSeats(ctx, res.ID, requested); err != nil {
+			return err
+		}
+		return h.outbox.Enqueue(ctx, domain.EventReservationHeld, res.ID, domain.ReservationHeldEvent{
+			ReservationID: res.ID,
+			UserID:        res.UserID,
+			EventID:       res.EventID,
+			SeatIDs:       requested,
+			TotalCents:    res.TotalCents,
+			ExpiresAt:     res.ExpiresAt,
+		})
 	})
 	if err != nil {
 		claimed = false

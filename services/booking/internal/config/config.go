@@ -21,6 +21,11 @@ type Config struct {
 	// holds. The service still starts without it and still serves seat maps,
 	// but every hold request is refused rather than taken unlocked (D12).
 	RedisAddr string
+	// AMQPURL is the broker the outbox relay publishes to (D9). Unlike Redis it
+	// is not a dependency of any request: with RabbitMQ down, events wait in the
+	// outbox and nothing a customer does fails. It carries credentials, so it
+	// has no default.
+	AMQPURL string
 	// HoldTTL is the checkout window. In P3 it is a real TTL on a Redis key,
 	// so it expires with nobody having to come back and look.
 	HoldTTL time.Duration
@@ -63,6 +68,7 @@ func Load() (Config, error) {
 		HTTPPort:    env("BOOKING_HTTP_PORT", "8080"),
 		GRPCPort:    env("BOOKING_GRPC_PORT", "9092"),
 		RedisAddr:   env("BOOKING_REDIS_ADDR", "redis:6379"),
+		AMQPURL:     os.Getenv("BOOKING_AMQP_URL"),
 		HoldTTL:     10 * time.Minute,
 
 		PaymentAddr:       env("BOOKING_PAYMENT_ADDR", "payment:9093"),
@@ -74,6 +80,11 @@ func Load() (Config, error) {
 	}
 	if cfg.DatabaseURL == "" {
 		return Config{}, fmt.Errorf("BOOKING_DATABASE_URL is required")
+	}
+	if cfg.AMQPURL == "" {
+		// Required even though the broker may be down: a relay with nowhere to
+		// publish would let the outbox grow forever while reporting healthy.
+		return Config{}, fmt.Errorf("BOOKING_AMQP_URL is required")
 	}
 	var err error
 	if cfg.HoldTTL, err = duration("BOOKING_HOLD_TTL", cfg.HoldTTL); err != nil {

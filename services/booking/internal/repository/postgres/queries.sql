@@ -282,3 +282,86 @@ SELECT id, booking_id, seat_id, qr_code, issued_at
 FROM tickets
 WHERE booking_id = $1
 ORDER BY seat_id;
+
+-- ---------------------------------------------------------------------------
+-- P4: the transactional outbox (D9, migration 000005).
+-- ---------------------------------------------------------------------------
+
+-- name: InsertOutboxEvent :exec
+--
+-- Only ever run inside the transaction of the state change the event describes
+-- (Repo.Enqueue refuses otherwise). That shared transaction is the whole
+-- pattern: the event commits with the change or not at all.
+INSERT INTO outbox (id, aggregate_id, event_type, payload, created_at)
+VALUES (@id, @aggregate_id, @event_type, @payload, @created_at);
+
+-- name: ClaimOutboxBatch :many
+--
+-- Leases a batch of unpublished rows to one relay, and commits at once.
+--
+-- No lock is held while publishing: the relay calls RabbitMQ after this
+-- statement returns, and a transaction may not span that call (D4). SKIP LOCKED
+-- only keeps two replicas' claim statements from queueing behind each other; it
+-- is the lease that keeps them from publishing the same row. A lapsed lease -
+-- the relay died, or the broker never confirmed - makes the row claimable again.
+--
+-- The lease is measured on the database clock, the same clock that checks it, so
+-- skew between replicas cannot shorten one. It is built with make_interval
+-- because sqlc mis-rewrites a named parameter multiplied by an interval literal.
+-- RETURNING has no order; the caller sorts by created_at.
+WITH batch AS (
+    SELECT o.id
+    FROM outbox o
+    WHERE o.published_at IS NULL
+      AND (o.claimed_until IS NULL OR o.claimed_until < now())
+    ORDER BY o.created_at
+    LIMIT @batch_size
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE outbox
+SET claimed_until = now() + make_interval(0, 0, 0, 0, 0, 0, @lease_seconds::float8)
+FROM batch
+WHERE outbox.id = batch.id
+RETURNING outbox.id, outbox.event_type, outbox.payload, outbox.created_at;
+
+-- name: MarkOutboxPublished :exec
+--
+-- Runs only for rows the broker has confirmed. A crash before this line means
+-- the row is published again once its lease lapses: a duplicate, which every
+-- consumer is required to survive (D10) - never a loss.
+UPDATE outbox
+SET published_at = now()
+WHERE id = ANY (@ids::uuid[]);
+
+-- name: ExpireLapsedReservations :many
+--
+-- Settles reservations whose checkout window closed unpaid, so reservation.expired
+-- can be written in the transaction that settles them.
+--
+-- This is not the sweeper coming back. It releases no seat and deletes no Redis
+-- key - the TTL still does that, unaided (§6.2 row 3). It moves a status and
+-- nothing else.
+--
+-- payment_pending_since IS NULL is D8. A reservation with a charge in doubt
+-- belongs to reconciliation, and expiring it here would turn a possibly-paid
+-- customer's reservation into one confirmation refuses. The predicate is checked
+-- again on the locked row, so a mark written by Pay between the scan and the
+-- update wins; and Pay's own mark only counts a row still 'pending', so an
+-- expiry that commits first stops the charge from starting.
+WITH lapsed AS (
+    SELECT r.id
+    FROM reservations r
+    WHERE r.status = 'pending'
+      AND r.payment_pending_since IS NULL
+      AND r.expires_at <= now()
+    ORDER BY r.expires_at
+    LIMIT @row_limit
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE reservations
+SET status = 'expired'
+FROM lapsed
+WHERE reservations.id = lapsed.id
+  AND reservations.status = 'pending'
+  AND reservations.payment_pending_since IS NULL
+RETURNING reservations.id, reservations.user_id, reservations.event_id, reservations.expires_at;

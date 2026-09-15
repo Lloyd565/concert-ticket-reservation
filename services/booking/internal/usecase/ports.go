@@ -104,6 +104,20 @@ type ReservationRepository interface {
 	ListReservationsAwaitingChargeRecheck(ctx context.Context, olderThan time.Time, limit int) ([]domain.Reservation, error)
 	// ClearChargeRecheck removes a reservation from the recheck queue.
 	ClearChargeRecheck(ctx context.Context, reservationID string) error
+	// ExpireLapsedReservations moves up to limit pending reservations whose
+	// window has closed, and whose payment outcome is not in doubt, to expired.
+	// Run it inside a transaction: the caller records each one's event there.
+	ExpireLapsedReservations(ctx context.Context, limit int) ([]domain.LapsedReservation, error)
+}
+
+// Outbox records an event for the relay to publish (D9, ARCHITECTURE.md §4.3).
+//
+// Enqueue joins the caller's transaction and fails outside one, and that refusal
+// is the point of the port: the event commits with the state change it describes
+// or not at all. Publishing after COMMIT instead loses the event whenever the
+// process dies between the two, and nothing afterwards knows one was owed.
+type Outbox interface {
+	Enqueue(ctx context.Context, eventType, aggregateID string, payload any) error
 }
 
 // BookingRepository is the confirmed-purchase port.

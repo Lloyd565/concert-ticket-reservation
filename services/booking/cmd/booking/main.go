@@ -30,6 +30,7 @@ import (
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/breaker"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/config"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/domain"
+	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/events"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/logging"
 	paymentclient "github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/payment"
 	"github.com/lloyd565/concert-ticket-reservation/services/booking/internal/repository/postgres"
@@ -88,11 +89,17 @@ func run(log *slog.Logger) error {
 	}
 	defer func() { _ = paymentConn.Close() }()
 
-	holder := usecase.NewHolder(txm, holds, repo, repo, cfg.HoldTTL, log)
+	// repo is also the outbox: every use case that changes state writes its
+	// event through it, inside the transaction of the change (D9).
+	holder := usecase.NewHolder(txm, holds, repo, repo, repo, cfg.HoldTTL, log)
 	seeder := usecase.NewSeeder(txm, repo)
-	saga := usecase.NewSaga(txm, holds, repo, repo, repo, paymentPort{paymentClient}, cfg.HoldTTL, log)
+	saga := usecase.NewSaga(txm, holds, repo, repo, repo, repo, paymentPort{paymentClient}, cfg.HoldTTL, log)
 	reconciler := usecase.NewReconciler(saga, repo, paymentPort{paymentClient},
 		cfg.ReconcileInterval, cfg.ReconcileGrace, 0, log)
+	expirer := usecase.NewExpirer(txm, repo, repo, log)
+	// Lazily connected, like Payment and Redis: Booking starts and serves with
+	// RabbitMQ down, and its events wait in the outbox (ARCHITECTURE.md §3.3).
+	relay := events.NewRelay(cfg.AMQPURL, repo, log)
 
 	// No sweeper. An abandoned checkout is released by the Redis key expiring,
 	// which needs no process, no ticker and no replica to be the one that owns
@@ -104,6 +111,11 @@ func run(log *slog.Logger) error {
 	// replica runs one; each pass claims its work by row lock, so two replicas
 	// racing the same reservation is safe rather than merely unlikely.
 	go reconciler.Run(ctx)
+	// P4. Both are safe on every replica for the same reason reconciliation is:
+	// each row is claimed by one short statement, so two replicas racing for it
+	// is harmless rather than merely unlikely.
+	go expirer.Run(ctx)
+	go relay.Run(ctx)
 
 	handler := bookinghttp.NewHandler(holder, seeder, saga, log)
 	// Readiness includes both dependency checks (NFR-4.4). Redis is in there

@@ -165,12 +165,14 @@ func applyMigrations(ctx context.Context, pool *pgxpool.Pool) error {
 // the subject; do inject faults into the dependency whose faults are.
 type fixture struct {
 	repo       *postgres.Repo
+	tx         *postgres.TxManager
 	holds      *bookingredis.Holds
 	redis      *goredis.Client
 	holder     *usecase.Holder
 	seeder     *usecase.Seeder
 	saga       *usecase.Saga
 	reconciler *usecase.Reconciler
+	expirer    *usecase.Expirer
 	payment    *fakePayment
 }
 
@@ -217,15 +219,17 @@ func newReplicaAt(t *testing.T, holdTTL time.Duration, redisAddr string) *fixtur
 	txm := postgres.NewTxManager(pool)
 	log := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelError}))
 	payment := newFakePayment()
-	saga := usecase.NewSaga(txm, holds, repo, repo, repo, payment, holdTTL, log)
+	saga := usecase.NewSaga(txm, holds, repo, repo, repo, repo, payment, holdTTL, log)
 
 	return &fixture{
-		repo:   repo,
-		holds:  holds,
-		redis:  rdb,
-		holder: usecase.NewHolder(txm, holds, repo, repo, holdTTL, log),
-		seeder: usecase.NewSeeder(txm, repo),
-		saga:   saga,
+		repo:    repo,
+		tx:      txm,
+		holds:   holds,
+		redis:   rdb,
+		holder:  usecase.NewHolder(txm, holds, repo, repo, repo, holdTTL, log),
+		expirer: usecase.NewExpirer(txm, repo, repo, log),
+		seeder:  usecase.NewSeeder(txm, repo),
+		saga:    saga,
 		// A long grace period, which is also what isolates these tests from
 		// each other: the reconciliation scan is global, so a test opts its own
 		// reservation in by backdating payment_pending_since (see

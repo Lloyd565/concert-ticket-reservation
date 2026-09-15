@@ -33,6 +33,72 @@ func (q *Queries) AttachSeatsToReservation(ctx context.Context, arg AttachSeatsT
 	return err
 }
 
+const claimOutboxBatch = `-- name: ClaimOutboxBatch :many
+WITH batch AS (
+    SELECT o.id
+    FROM outbox o
+    WHERE o.published_at IS NULL
+      AND (o.claimed_until IS NULL OR o.claimed_until < now())
+    ORDER BY o.created_at
+    LIMIT $2
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE outbox
+SET claimed_until = now() + make_interval(0, 0, 0, 0, 0, 0, $1::float8)
+FROM batch
+WHERE outbox.id = batch.id
+RETURNING outbox.id, outbox.event_type, outbox.payload, outbox.created_at
+`
+
+type ClaimOutboxBatchParams struct {
+	LeaseSeconds float64
+	BatchSize    int32
+}
+
+type ClaimOutboxBatchRow struct {
+	ID        uuid.UUID
+	EventType string
+	Payload   []byte
+	CreatedAt time.Time
+}
+
+// Leases a batch of unpublished rows to one relay, and commits at once.
+//
+// No lock is held while publishing: the relay calls RabbitMQ after this
+// statement returns, and a transaction may not span that call (D4). SKIP LOCKED
+// only keeps two replicas' claim statements from queueing behind each other; it
+// is the lease that keeps them from publishing the same row. A lapsed lease -
+// the relay died, or the broker never confirmed - makes the row claimable again.
+//
+// The lease is measured on the database clock, the same clock that checks it, so
+// skew between replicas cannot shorten one. It is built with make_interval
+// because sqlc mis-rewrites a named parameter multiplied by an interval literal.
+// RETURNING has no order; the caller sorts by created_at.
+func (q *Queries) ClaimOutboxBatch(ctx context.Context, arg ClaimOutboxBatchParams) ([]ClaimOutboxBatchRow, error) {
+	rows, err := q.db.Query(ctx, claimOutboxBatch, arg.LeaseSeconds, arg.BatchSize)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ClaimOutboxBatchRow
+	for rows.Next() {
+		var i ClaimOutboxBatchRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.EventType,
+			&i.Payload,
+			&i.CreatedAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const clearChargeRecheck = `-- name: ClearChargeRecheck :exec
 DELETE FROM charge_rechecks
 WHERE reservation_id = $1
@@ -130,6 +196,71 @@ type CreateTicketsParams struct {
 	BookingID uuid.UUID
 	SeatID    uuid.UUID
 	QrCode    string
+}
+
+const expireLapsedReservations = `-- name: ExpireLapsedReservations :many
+WITH lapsed AS (
+    SELECT r.id
+    FROM reservations r
+    WHERE r.status = 'pending'
+      AND r.payment_pending_since IS NULL
+      AND r.expires_at <= now()
+    ORDER BY r.expires_at
+    LIMIT $1
+    FOR UPDATE SKIP LOCKED
+)
+UPDATE reservations
+SET status = 'expired'
+FROM lapsed
+WHERE reservations.id = lapsed.id
+  AND reservations.status = 'pending'
+  AND reservations.payment_pending_since IS NULL
+RETURNING reservations.id, reservations.user_id, reservations.event_id, reservations.expires_at
+`
+
+type ExpireLapsedReservationsRow struct {
+	ID        uuid.UUID
+	UserID    uuid.UUID
+	EventID   uuid.UUID
+	ExpiresAt time.Time
+}
+
+// Settles reservations whose checkout window closed unpaid, so reservation.expired
+// can be written in the transaction that settles them.
+//
+// This is not the sweeper coming back. It releases no seat and deletes no Redis
+// key - the TTL still does that, unaided (§6.2 row 3). It moves a status and
+// nothing else.
+//
+// payment_pending_since IS NULL is D8. A reservation with a charge in doubt
+// belongs to reconciliation, and expiring it here would turn a possibly-paid
+// customer's reservation into one confirmation refuses. The predicate is checked
+// again on the locked row, so a mark written by Pay between the scan and the
+// update wins; and Pay's own mark only counts a row still 'pending', so an
+// expiry that commits first stops the charge from starting.
+func (q *Queries) ExpireLapsedReservations(ctx context.Context, rowLimit int32) ([]ExpireLapsedReservationsRow, error) {
+	rows, err := q.db.Query(ctx, expireLapsedReservations, rowLimit)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	var items []ExpireLapsedReservationsRow
+	for rows.Next() {
+		var i ExpireLapsedReservationsRow
+		if err := rows.Scan(
+			&i.ID,
+			&i.UserID,
+			&i.EventID,
+			&i.ExpiresAt,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
 }
 
 const getBookingByReservation = `-- name: GetBookingByReservation :one
@@ -322,6 +453,38 @@ func (q *Queries) GetSeatsForEvent(ctx context.Context, arg GetSeatsForEventPara
 		return nil, err
 	}
 	return items, nil
+}
+
+const insertOutboxEvent = `-- name: InsertOutboxEvent :exec
+
+INSERT INTO outbox (id, aggregate_id, event_type, payload, created_at)
+VALUES ($1, $2, $3, $4, $5)
+`
+
+type InsertOutboxEventParams struct {
+	ID          uuid.UUID
+	AggregateID uuid.UUID
+	EventType   string
+	Payload     []byte
+	CreatedAt   time.Time
+}
+
+// ---------------------------------------------------------------------------
+// P4: the transactional outbox (D9, migration 000005).
+// ---------------------------------------------------------------------------
+//
+// Only ever run inside the transaction of the state change the event describes
+// (Repo.Enqueue refuses otherwise). That shared transaction is the whole
+// pattern: the event commits with the change or not at all.
+func (q *Queries) InsertOutboxEvent(ctx context.Context, arg InsertOutboxEventParams) error {
+	_, err := q.db.Exec(ctx, insertOutboxEvent,
+		arg.ID,
+		arg.AggregateID,
+		arg.EventType,
+		arg.Payload,
+		arg.CreatedAt,
+	)
+	return err
 }
 
 const listReservationsAwaitingChargeRecheck = `-- name: ListReservationsAwaitingChargeRecheck :many
@@ -632,6 +795,20 @@ func (q *Queries) LockSeatsByReservation(ctx context.Context, reservationID uuid
 		return nil, err
 	}
 	return items, nil
+}
+
+const markOutboxPublished = `-- name: MarkOutboxPublished :exec
+UPDATE outbox
+SET published_at = now()
+WHERE id = ANY ($1::uuid[])
+`
+
+// Runs only for rows the broker has confirmed. A crash before this line means
+// the row is published again once its lease lapses: a duplicate, which every
+// consumer is required to survive (D10) - never a loss.
+func (q *Queries) MarkOutboxPublished(ctx context.Context, ids []uuid.UUID) error {
+	_, err := q.db.Exec(ctx, markOutboxPublished, ids)
+	return err
 }
 
 const markPaymentPending = `-- name: MarkPaymentPending :execrows

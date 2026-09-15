@@ -31,6 +31,16 @@ type Event struct {
 	CreatedAt time.Time
 }
 
+type Outbox struct {
+	ID           uuid.UUID
+	AggregateID  uuid.UUID
+	EventType    string
+	Payload      []byte
+	CreatedAt    time.Time
+	PublishedAt  *time.Time
+	ClaimedUntil *time.Time
+}
+
 type Reservation struct {
 	ID                  uuid.UUID
 	UserID              uuid.UUID

@@ -39,6 +39,7 @@ type Saga struct {
 	seats        SeatRepository
 	reservations ReservationRepository
 	bookings     BookingRepository
+	outbox       Outbox
 	payments     PaymentClient
 	// holdTTL is the checkout window, needed here because D8 has to push a
 	// hold out past it - see KeepHold.
@@ -47,11 +48,11 @@ type Saga struct {
 }
 
 // NewSaga wires a Saga.
-func NewSaga(tx TxManager, holds HoldStore, seats SeatRepository, reservations ReservationRepository, bookings BookingRepository, payments PaymentClient, holdTTL time.Duration, log *slog.Logger) *Saga {
+func NewSaga(tx TxManager, holds HoldStore, seats SeatRepository, reservations ReservationRepository, bookings BookingRepository, outbox Outbox, payments PaymentClient, holdTTL time.Duration, log *slog.Logger) *Saga {
 	if holdTTL <= 0 {
 		holdTTL = DefaultHoldTTL
 	}
-	return &Saga{tx: tx, holds: holds, seats: seats, reservations: reservations, bookings: bookings, payments: payments, holdTTL: holdTTL, log: log}
+	return &Saga{tx: tx, holds: holds, seats: seats, reservations: reservations, bookings: bookings, outbox: outbox, payments: payments, holdTTL: holdTTL, log: log}
 }
 
 // Confirmation is a completed purchase.
@@ -388,6 +389,28 @@ func (s *Saga) ConfirmPaid(ctx context.Context, reservationID string, charge dom
 			return err
 		}
 
+		// booking.confirmed is written here, inside the transaction, and not
+		// published once it commits (D9). A publish after COMMIT is lost whenever
+		// the process dies between the two: the customer has paid and has a
+		// booking, their tickets are never sent, and nothing anywhere records that
+		// an event was owed - a replayed Pay answers from existingConfirmation and
+		// reconciliation never looks at a confirmed reservation.
+		issued := make([]domain.TicketIssued, 0, len(tickets))
+		for _, t := range tickets {
+			issued = append(issued, domain.TicketIssued{TicketID: t.ID, SeatID: t.SeatID, QRCode: t.QRCode})
+		}
+		if err := s.outbox.Enqueue(ctx, domain.EventBookingConfirmed, res.ID, domain.BookingConfirmedEvent{
+			BookingID:     booking.ID,
+			ReservationID: res.ID,
+			UserID:        res.UserID,
+			EventID:       res.EventID,
+			PaymentID:     charge.ChargeID,
+			TotalCents:    res.TotalCents,
+			Tickets:       issued,
+		}); err != nil {
+			return err
+		}
+
 		out = Confirmation{ReservationID: res.ID, Status: domain.ReservationConfirmed, Booking: booking, Tickets: tickets}
 		return nil
 	})
@@ -616,8 +639,15 @@ func (s *Saga) ReleaseRefunded(ctx context.Context, reservationID string) error 
 		if _, err := s.bookings.SetBookingStatus(ctx, booking.ID, domain.BookingConfirmed, domain.BookingRefunded); err != nil {
 			return err
 		}
-		_, err = s.reservations.SetReservationStatus(ctx, res.ID, domain.ReservationConfirmed, domain.ReservationRefunded)
-		return err
+		if _, err := s.reservations.SetReservationStatus(ctx, res.ID, domain.ReservationConfirmed, domain.ReservationRefunded); err != nil {
+			return err
+		}
+		// In the transaction, for the reason booking.confirmed is (D9).
+		return s.outbox.Enqueue(ctx, domain.EventBookingRefunded, res.ID, domain.BookingRefundedEvent{
+			BookingID:     booking.ID,
+			ReservationID: res.ID,
+			UserID:        res.UserID,
+		})
 	})
 	if err != nil {
 		return err
