@@ -1,25 +1,17 @@
-# Binaries
-*.exe
-*.exe~
-*.dll
-*.so
-*.dylib
-/bin/
-/out/
+# Dependencies & build output
+node_modules/
+dist/
+coverage/
+*.tsbuildinfo
 
-# Test & coverage
-*.test
-*.out
-coverage.*
-
-# Go workspace
-go.work
-go.work.sum
-
-# Env / secrets — never commit these (AGENTS.md §2.12)
+# Env / secrets. .env.test holds throwaway test-only values and is committed.
 .env
 .env.*
 !.env.example
+!.env.test
+
+# Logs
+*.log
 
 # Tooling / editors
 .idea/
