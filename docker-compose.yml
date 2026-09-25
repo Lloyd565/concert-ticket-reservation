@@ -1,0 +1,332 @@
+# Local stack. P4 scope: Postgres (booking_db), auth_db, payment_db, notif_db,
+# Redis, RabbitMQ, TWO Booking replicas, Auth, Payment, Notification, Gateway.
+# Jaeger, Prometheus, Grafana and the seed job are added in P5.
+#
+# Booking runs two replicas sharing one Postgres and one Redis, and they
+# coordinate through nothing else: no leader, no sticky routing, no in-process
+# state that matters. That is what P3 buys - a hold is a Redis key with a TTL,
+# so no replica has to be the one that owns expiry, and there is no sweeper for
+# a second replica to duplicate or fight with.
+#
+# Start-order dependencies are minimal and deliberate. Each service waits only
+# on its own database, plus Redis for Booking; the gateway waits on nothing
+# because it dials Auth and Booking lazily, and Booking does not wait on Payment
+# because it dials it lazily too - holds and seat maps work with Payment down,
+# and only the pay step does not (ARCHITECTURE.md §3.3).
+#
+# Nothing waits on RabbitMQ except Notification, for which it is the only source
+# of work. Booking and Payment write every event to their own outbox table and
+# relay it whenever the broker is reachable, so a broker outage delays emails and
+# nothing else, and Notification being down delays nothing at all.
+#
+# Build contexts are the repository root because every service depends on the
+# shared proto module through a replace directive.
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${BOOKING_DB_NAME:-booking_db}
+    ports:
+      - "${POSTGRES_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${BOOKING_DB_NAME:-booking_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # A separate container, not a second database in the one above: database per
+  # service (D2), and Auth's data has a different security posture to Booking's.
+  auth_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${AUTH_DB_NAME:-auth_db}
+    ports:
+      - "${AUTH_POSTGRES_PORT:-5433}:5432"
+    volumes:
+      - authdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${AUTH_DB_NAME:-auth_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # A third container, not a third database in one of the others: database per
+  # service (D2). Payment's data is the only data in the system that is about
+  # money, and NFR-5.4 keeps it that way.
+  payment_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${PAYMENT_DB_NAME:-payment_db}
+    ports:
+      - "${PAYMENT_POSTGRES_PORT:-5434}:5432"
+    volumes:
+      - paymentdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${PAYMENT_DB_NAME:-payment_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  # The hold store, and in P3 the lock on the hottest path in the system.
+  #
+  # No volume, on purpose. Everything in here is a seat hold with a TTL of
+  # minutes; a Redis restart loses them all and that is safe, because Postgres
+  # owns every confirmed booking and an unconfirmed hold has nothing to lose.
+  # Persisting them would mean reasoning about a stale hold surviving a restart,
+  # which is strictly worse than having none.
+  redis:
+    image: redis:7-alpine
+    # No RDB or AOF: see above.
+    command: ["redis-server", "--save", "", "--appendonly", "no"]
+    ports:
+      - "${REDIS_PORT:-6379}:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 5s
+
+  payment:
+    build:
+      context: .
+      dockerfile: services/payment/Dockerfile
+    environment:
+      PAYMENT_HTTP_PORT: "8082"
+      PAYMENT_GRPC_PORT: "9093"
+      PAYMENT_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@payment_db:5432/${PAYMENT_DB_NAME:-payment_db}?sslmode=disable
+      # succeed | decline | hang. Real money is out of scope; this is the knob
+      # that makes the saga's compensation paths demonstrable in a running
+      # stack. Set it to hang, then watch a hold's TTL get pushed out
+      # (redis-cli TTL seat:hold:...) instead of lapsing, and the reconciliation
+      # job resolve it - D8 in a running system.
+      PAYMENT_PROVIDER_MODE: ${PAYMENT_PROVIDER_MODE:-succeed}
+      PAYMENT_PROVIDER_LATENCY: ${PAYMENT_PROVIDER_LATENCY:-0s}
+      PAYMENT_PROVIDER_TIMEOUT: ${PAYMENT_PROVIDER_TIMEOUT:-1s}
+      PAYMENT_PROVIDER_MAX_ATTEMPTS: ${PAYMENT_PROVIDER_MAX_ATTEMPTS:-2}
+      # The outbox relay's broker. Dialled lazily and retried, so Payment answers
+      # Booking with RabbitMQ down - which is why it is not in depends_on.
+      PAYMENT_AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+    ports:
+      - "${PAYMENT_HTTP_PORT:-8082}:8082"
+      - "${PAYMENT_GRPC_PORT:-9093}:9093"
+    depends_on:
+      payment_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8082/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  booking:
+    build:
+      context: .
+      dockerfile: services/booking/Dockerfile
+    environment:
+      BOOKING_HTTP_PORT: "8080"
+      BOOKING_GRPC_PORT: "9092"
+      # Container-side DSN: the host is the compose service name, not localhost.
+      BOOKING_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@postgres:5432/${BOOKING_DB_NAME:-booking_db}?sslmode=disable
+      # The hold store. Unlike Payment this is not optional: with Redis
+      # unreachable a replica refuses new holds rather than taking them without
+      # a lock (D12), so it is a real dependency and waits for one below.
+      BOOKING_REDIS_ADDR: redis:6379
+      # The checkout window, and now literally the EX on the Redis key.
+      BOOKING_HOLD_TTL: ${BOOKING_HOLD_TTL:-10m}
+      # The one synchronous service-to-service call in the system. Dialled
+      # lazily - deliberately no depends_on below (ARCHITECTURE.md §3.3).
+      BOOKING_PAYMENT_ADDR: payment:9093
+      BOOKING_PAYMENT_TIMEOUT: ${BOOKING_PAYMENT_TIMEOUT:-3s}
+      BOOKING_BREAKER_THRESHOLD: ${BOOKING_BREAKER_THRESHOLD:-5}
+      BOOKING_BREAKER_COOLDOWN: ${BOOKING_BREAKER_COOLDOWN:-30s}
+      # Reconciliation owns every reservation whose payment outcome is unknown.
+      # In P3 owning one also means keeping its hold alive, because the TTL
+      # would otherwise put those seats back on sale under a charge that may
+      # have succeeded (D8). It must therefore run well inside the hold TTL.
+      BOOKING_RECONCILE_INTERVAL: ${BOOKING_RECONCILE_INTERVAL:-15s}
+      BOOKING_RECONCILE_GRACE: ${BOOKING_RECONCILE_GRACE:-30s}
+      # The outbox relay's broker (D9). Not a dependency of any request: with
+      # RabbitMQ down, holds and confirmations commit their events to the outbox
+      # and the relay drains it later - so, again, not in depends_on.
+      BOOKING_AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+    # Two replicas, and the concurrency test says they are safe together
+    # (make test-concurrency). Scale it further with
+    # `docker compose up -d --scale booking=N`; nothing in the service cares how
+    # many there are.
+    deploy:
+      replicas: 2
+    # Deliberately publishes nothing. Two containers cannot share a host port,
+    # and a fixed one could only ever reach one replica - which would make
+    # anything debugged through it a lie about how the system behaves. The
+    # gateway reaches both by service name over the compose network and is the
+    # front door for every Booking route anyway; to poke one replica directly,
+    # `docker compose exec booking wget -qO- localhost:8080/ready` (add
+    # `--index=2` for the second).
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    healthcheck:
+      # Liveness. Readiness is /ready, which also checks Redis: a replica that
+      # cannot claim a seat should leave the rotation rather than answer 503 to
+      # every customer.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8080/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  auth:
+    build:
+      context: .
+      dockerfile: services/auth/Dockerfile
+    environment:
+      AUTH_HTTP_PORT: "8081"
+      AUTH_GRPC_PORT: "9091"
+      AUTH_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@auth_db:5432/${AUTH_DB_NAME:-auth_db}?sslmode=disable
+      # Shared with the gateway, which verifies signatures with it. The service
+      # refuses to start if it is short or unset - see internal/config.
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - see .env.example}
+      JWT_ISSUER: ${JWT_ISSUER:-concert-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-concert-api}
+      AUTH_ACCESS_TTL: ${AUTH_ACCESS_TTL:-15m}
+      AUTH_REFRESH_TTL: ${AUTH_REFRESH_TTL:-168h}
+      # Creates the first admin if none exists, so a fresh stack is demoable
+      # with no manual psql step. A no-op on every later start. Unset both to
+      # disable.
+      BOOTSTRAP_ADMIN_EMAIL: ${BOOTSTRAP_ADMIN_EMAIL:-}
+      BOOTSTRAP_ADMIN_PASSWORD: ${BOOTSTRAP_ADMIN_PASSWORD:-}
+    ports:
+      - "${AUTH_HTTP_PORT:-8081}:8081"
+      - "${AUTH_GRPC_PORT:-9091}:9091"
+    depends_on:
+      auth_db:
+        condition: service_healthy
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8081/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  gateway:
+    build:
+      context: .
+      dockerfile: services/gateway/Dockerfile
+    environment:
+      GATEWAY_HTTP_PORT: "8000"
+      GATEWAY_AUTH_ADDR: auth:9091
+      # Resolves to whichever Booking replicas are up. Seat state is in Postgres
+      # and Redis, so it does not matter which one a request lands on.
+      GATEWAY_BOOKING_ADDR: booking:9092
+      # The same secret Auth signs with. Verification is local: the gateway
+      # never calls Auth to check an access token (ARCHITECTURE.md §3.3).
+      JWT_SECRET: ${JWT_SECRET:?JWT_SECRET must be set - see .env.example}
+      JWT_ISSUER: ${JWT_ISSUER:-concert-auth}
+      JWT_AUDIENCE: ${JWT_AUDIENCE:-concert-api}
+      GATEWAY_RATE_LIMIT_RPS: ${GATEWAY_RATE_LIMIT_RPS:-20}
+      GATEWAY_RATE_LIMIT_BURST: ${GATEWAY_RATE_LIMIT_BURST:-40}
+      GATEWAY_UPSTREAM_TIMEOUT: ${GATEWAY_UPSTREAM_TIMEOUT:-5s}
+    ports:
+      - "${GATEWAY_HTTP_PORT:-8000}:8000"
+    # Deliberately no depends_on. The gateway must come up with its upstreams
+    # down; making it wait would contradict the failure-domain design it exists
+    # to demonstrate.
+    healthcheck:
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8000/health || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 5
+      start_period: 5s
+
+  # The event bus (ARCHITECTURE.md §4.2).
+  rabbitmq:
+    image: rabbitmq:4-management-alpine
+    # Fixed, because RabbitMQ keys its data directory on the node name. With a
+    # generated hostname a recreated container is a different node, and the
+    # durable queues - with every message waiting in them - stay behind.
+    hostname: rabbitmq
+    environment:
+      RABBITMQ_DEFAULT_USER: ${RABBITMQ_USER:-guest}
+      RABBITMQ_DEFAULT_PASS: ${RABBITMQ_PASSWORD:-guest}
+    ports:
+      - "${RABBITMQ_PORT:-5672}:5672"
+      # Management UI: queue depths, notification.dlq, moving messages back.
+      - "${RABBITMQ_MANAGEMENT_PORT:-15672}:15672"
+    volumes:
+      - rabbitdata:/var/lib/rabbitmq
+    healthcheck:
+      test: ["CMD", "rabbitmq-diagnostics", "-q", "ping"]
+      interval: 5s
+      timeout: 10s
+      retries: 12
+      start_period: 20s
+
+  # A fourth database container: database per service (D2).
+  notif_db:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER:-postgres}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-postgres}
+      POSTGRES_DB: ${NOTIFICATION_DB_NAME:-notif_db}
+    ports:
+      - "${NOTIFICATION_POSTGRES_PORT:-5436}:5432"
+    volumes:
+      - notifdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER:-postgres} -d ${NOTIFICATION_DB_NAME:-notif_db}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+      start_period: 10s
+
+  notification:
+    build:
+      context: .
+      dockerfile: services/notification/Dockerfile
+    environment:
+      NOTIFICATION_HTTP_PORT: "8083"
+      NOTIFICATION_DATABASE_URL: postgres://${POSTGRES_USER:-postgres}:${POSTGRES_PASSWORD:-postgres}@notif_db:5432/${NOTIFICATION_DB_NAME:-notif_db}?sslmode=disable
+      NOTIFICATION_AMQP_URL: amqp://${RABBITMQ_USER:-guest}:${RABBITMQ_PASSWORD:-guest}@rabbitmq:5672/
+      # succeed | fail. fail refuses every email: watch the retries land in
+      # delivery_attempts and the message move to notification.dlq.
+      NOTIFICATION_MAIL_MODE: ${NOTIFICATION_MAIL_MODE:-succeed}
+    ports:
+      - "${NOTIFICATION_HTTP_PORT:-8083}:8083"
+    # Its own database, and the broker that is its only source of work. Nothing
+    # waits on it in return: stop it and Booking confirms exactly as before.
+    depends_on:
+      notif_db:
+        condition: service_healthy
+      rabbitmq:
+        condition: service_healthy
+    healthcheck:
+      # Readiness rather than liveness: ready means its queue is declared and
+      # consumed, so `docker compose up --wait` does not return before events
+      # published from then on have somewhere to wait.
+      test: ["CMD-SHELL", "wget -qO- http://localhost:8083/ready || exit 1"]
+      interval: 5s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+volumes:
+  pgdata:
+  authdata:
+  paymentdata:
+  notifdata:
+  rabbitdata:

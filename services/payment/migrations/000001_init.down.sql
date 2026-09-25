@@ -1,0 +1,2 @@
+DROP TABLE IF EXISTS refunds;
+DROP TABLE IF EXISTS charges;

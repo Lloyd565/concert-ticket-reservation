@@ -1,0 +1,28 @@
+# Binaries
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+/bin/
+/out/
+
+# Test & coverage
+*.test
+*.out
+coverage.*
+
+# Go workspace
+go.work
+go.work.sum
+
+# Env / secrets — never commit these (AGENTS.md §2.12)
+.env
+.env.*
+!.env.example
+
+# Tooling / editors
+.idea/
+.vscode/
+*.swp
+.DS_Store
