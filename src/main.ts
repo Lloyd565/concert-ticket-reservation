@@ -7,8 +7,6 @@ import { EnvironmentVariables } from './config/env.validation';
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
 
-  // Served by Swagger's own route, outside the controller guards, so the docs
-  // page itself needs no token. Use "Authorize" to paste an access token.
   const openApi = new DocumentBuilder()
     .setTitle('Concert Ticket Reservation API')
     .setVersion('1.0')

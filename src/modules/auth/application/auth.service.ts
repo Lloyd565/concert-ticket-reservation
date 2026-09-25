@@ -13,13 +13,10 @@ import { UserRepository } from '../../users/domain/user.repository';
 import { InvalidCredentialsError } from '../domain/auth.errors';
 import { JwtPayload } from '../domain/jwt-payload';
 
-// Compared against when the email is unknown, so that path costs one bcrypt
-// round like a wrong password does and timing does not reveal the difference.
 const DUMMY_HASH = hashSync('timing-equalizer', 10);
 
 export interface AccessToken {
   accessToken: string;
-  /** Lifetime in seconds. */
   expiresIn: number;
 }
 
@@ -32,7 +29,6 @@ export class AuthService {
     private readonly config: ConfigService<EnvironmentVariables, true>,
   ) {}
 
-  /** Self-registration always yields a USER; admins come only from bootstrap. */
   register(email: string, password: string): Promise<User> {
     return this.usersService.createUser(email, password, Role.USER);
   }

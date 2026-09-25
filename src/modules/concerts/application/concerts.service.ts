@@ -30,8 +30,6 @@ export class ConcertsService {
   }
 
   update(id: string, changes: ConcertChanges): Promise<Concert> {
-    // Locked like a reservation, because shrinking capacity is the other way
-    // to break "reserved <= capacity".
     return this.tx.run(async () => {
       const concert = await this.concerts.findByIdForUpdate(id);
       if (!concert) throw new ConcertNotFoundError();
@@ -46,8 +44,6 @@ export class ConcertsService {
   }
 
   delete(id: string): Promise<void> {
-    // The lock stops a reservation from being created between the check and
-    // the delete.
     return this.tx.run(async () => {
       const concert = await this.concerts.findByIdForUpdate(id);
       if (!concert) throw new ConcertNotFoundError();

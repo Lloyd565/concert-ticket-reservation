@@ -35,21 +35,16 @@ import { ReservationsModule } from './modules/reservations/reservations.module';
     ConcertsModule,
     ReservationsModule,
   ],
-  // Registered as providers rather than in main.ts so that e2e tests, which
-  // boot AppModule directly, get exactly the same pipe and filter.
   providers: [
     {
       provide: APP_PIPE,
       useValue: new ValidationPipe({
-        // Unknown fields are rejected, not silently dropped, so a client
-        // cannot smuggle in properties like `role` and only find out later.
         whitelist: true,
         forbidNonWhitelisted: true,
         transform: true,
       }),
     },
     { provide: APP_FILTER, useClass: DomainExceptionFilter },
-    // Order matters: authenticate first (sets request.user), then authorize.
     { provide: APP_GUARD, useClass: JwtAuthGuard },
     { provide: APP_GUARD, useClass: RolesGuard },
   ],

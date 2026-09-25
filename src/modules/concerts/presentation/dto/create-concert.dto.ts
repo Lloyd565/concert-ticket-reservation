@@ -1,3 +1,4 @@
+import { ApiProperty } from '@nestjs/swagger';
 import { Type } from 'class-transformer';
 import {
   IsDate,
@@ -24,7 +25,7 @@ export class CreateConcertDto {
   @MaxLength(200)
   venue: string;
 
-  /** ISO 8601, e.g. 2026-12-31T19:00:00Z */
+  @ApiProperty({ description: 'ISO 8601, e.g. 2026-12-31T19:00:00Z' })
   @Type(() => Date)
   @IsDate()
   startsAt: Date;
@@ -33,7 +34,7 @@ export class CreateConcertDto {
   @Min(1)
   capacity: number;
 
-  /** Whole IDR, no decimals. */
+  @ApiProperty({ description: 'Whole IDR, no decimals.' })
   @IsInt()
   @Min(0)
   price: number;

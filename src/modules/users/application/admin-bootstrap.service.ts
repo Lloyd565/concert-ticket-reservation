@@ -6,10 +6,6 @@ import { EmailAlreadyRegisteredError } from '../domain/user.errors';
 import { UserRepository } from '../domain/user.repository';
 import { UsersService } from './users.service';
 
-/**
- * Creates the first ADMIN from ADMIN_EMAIL / ADMIN_PASSWORD so a fresh clone is
- * demoable without manual SQL. Idempotent: does nothing once any admin exists.
- */
 @Injectable()
 export class AdminBootstrapService implements OnApplicationBootstrap {
   private readonly logger = new Logger(AdminBootstrapService.name);
@@ -31,8 +27,6 @@ export class AdminBootstrapService implements OnApplicationBootstrap {
       );
       this.logger.log(`Created initial admin ${email}`);
     } catch (err) {
-      // Either another instance won the race, or the email already belongs to
-      // a regular USER; never silently promote an existing account.
       if (!(err instanceof EmailAlreadyRegisteredError)) throw err;
       this.logger.warn(`Admin not created: ${email} is already registered`);
     }

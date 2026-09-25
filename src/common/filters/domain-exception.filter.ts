@@ -16,8 +16,6 @@ const HTTP_BY_KIND: Record<
   UNAUTHORIZED: { status: HttpStatus.UNAUTHORIZED, error: 'Unauthorized' },
 };
 
-// Same body shape as Nest's built-in HttpException responses, so clients see
-// one error format whether a guard, the ValidationPipe or a use case failed.
 @Catch(DomainError)
 export class DomainExceptionFilter implements ExceptionFilter<DomainError> {
   catch(error: DomainError, host: ArgumentsHost): void {

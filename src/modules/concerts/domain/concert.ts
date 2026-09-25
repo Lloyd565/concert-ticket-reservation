@@ -5,7 +5,6 @@ export interface Concert {
   venue: string;
   startsAt: Date;
   capacity: number;
-  /** Whole currency units (IDR has no minor unit); integer, never a float. */
   price: number;
   createdAt: Date;
 }

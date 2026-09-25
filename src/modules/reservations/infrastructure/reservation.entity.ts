@@ -14,7 +14,6 @@ import { ReservationStatus } from '../domain/reservation';
 
 @Entity('reservations')
 @Check('CHK_reservations_quantity_positive', `"quantity" > 0`)
-// Serves the per-concert SUM of active seats taken under the concert lock.
 @Index('IDX_reservations_concert_status', ['concertId', 'status'])
 @Index('IDX_reservations_user', ['userId'])
 export class ReservationOrmEntity {
@@ -24,8 +23,6 @@ export class ReservationOrmEntity {
   @Column({ name: 'user_id', type: 'uuid' })
   userId: string;
 
-  // N:1 User. CASCADE: deleting a user removes their reservations and so
-  // frees their seats.
   @ManyToOne(() => UserOrmEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'user_id' })
   user?: UserOrmEntity;
@@ -33,8 +30,6 @@ export class ReservationOrmEntity {
   @Column({ name: 'concert_id', type: 'uuid' })
   concertId: string;
 
-  // N:1 Concert. CASCADE only ever removes CANCELLED rows: the service refuses
-  // to delete a concert that still has ACTIVE reservations.
   @ManyToOne(() => ConcertOrmEntity, { onDelete: 'CASCADE' })
   @JoinColumn({ name: 'concert_id' })
   concert?: ConcertOrmEntity;

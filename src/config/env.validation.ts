@@ -1,5 +1,3 @@
-// Implicit type conversion reads design:type metadata; load it here rather
-// than relying on Nest having imported it first (unit tests, migration CLI).
 import 'reflect-metadata';
 import { plainToInstance } from 'class-transformer';
 import {
@@ -45,7 +43,6 @@ export class EnvironmentVariables {
   @IsNotEmpty()
   DB_NAME: string;
 
-  // HS256 is only as strong as its key; 32 bytes matches the hash output size.
   @IsString()
   @MinLength(32)
   JWT_SECRET: string;
@@ -65,14 +62,11 @@ export class EnvironmentVariables {
 
 const SECONDS_PER_UNIT = { s: 1, m: 60, h: 3600, d: 86400 } as const;
 
-/** Converts a validated duration such as '15m' into seconds. */
 export function durationToSeconds(duration: string): number {
   const unit = duration.slice(-1) as keyof typeof SECONDS_PER_UNIT;
   return Number(duration.slice(0, -1)) * SECONDS_PER_UNIT[unit];
 }
 
-// Runs at boot (ConfigModule) and in the migration CLI, so a missing or
-// malformed variable stops the process before anything touches the database.
 export function validateEnv(
   config: Record<string, unknown>,
 ): EnvironmentVariables {

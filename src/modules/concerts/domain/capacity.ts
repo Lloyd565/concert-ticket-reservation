@@ -3,11 +3,6 @@ import {
   NotEnoughSeatsError,
 } from './concert.errors';
 
-// The core invariant: for a concert, the sum of ACTIVE reservation quantities
-// never exceeds capacity. These checks are only sound when `reserved` was read
-// after locking the concert row (see ConcertRepository.findByIdForUpdate).
-
-/** @throws NotEnoughSeatsError */
 export function assertSeatsAvailable(
   capacity: number,
   reserved: number,
@@ -18,7 +13,6 @@ export function assertSeatsAvailable(
   }
 }
 
-/** @throws CapacityBelowReservedError */
 export function assertCapacityCoversReserved(
   capacity: number,
   reserved: number,

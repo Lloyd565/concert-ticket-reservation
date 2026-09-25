@@ -8,14 +8,13 @@ import {
   Patch,
   Post,
 } from '@nestjs/common';
-import { ApiBearerAuth, ApiTags } from '@nestjs/swagger';
+import { ApiBearerAuth, ApiOperation, ApiTags } from '@nestjs/swagger';
 import { CurrentUser } from '../../../common/decorators/current-user.decorator';
 import type { AuthenticatedUser } from '../../auth/domain/authenticated-user';
 import { ReservationsService } from '../application/reservations.service';
 import { CreateReservationDto } from './dto/create-reservation.dto';
 import { UpdateReservationDto } from './dto/update-reservation.dto';
 
-// No @Public(): every route here requires a token (global JwtAuthGuard).
 @ApiTags('reservations')
 @ApiBearerAuth()
 @Controller('reservations')
@@ -52,7 +51,10 @@ export class ReservationsController {
     return this.reservations.changeQuantity(user, id, dto.quantity);
   }
 
-  /** Cancels (status CANCELLED, seats freed); the row is kept as history. */
+  @ApiOperation({
+    summary:
+      'Cancels (status CANCELLED, seats freed); the row is kept as history.',
+  })
   @Delete(':id')
   cancel(
     @CurrentUser() user: AuthenticatedUser,

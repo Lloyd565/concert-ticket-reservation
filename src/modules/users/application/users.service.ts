@@ -10,7 +10,6 @@ const BCRYPT_COST = 10;
 export class UsersService {
   constructor(private readonly users: UserRepository) {}
 
-  /** @throws EmailAlreadyRegisteredError */
   async createUser(email: string, password: string, role: Role): Promise<User> {
     return this.users.create({
       email: normalizeEmail(email),

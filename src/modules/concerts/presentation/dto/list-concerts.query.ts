@@ -8,7 +8,6 @@ export class ListConcertsQuery {
   @Min(1)
   page: number = 1;
 
-  // Capped so one request cannot ask for the whole table.
   @IsOptional()
   @Type(() => Number)
   @IsInt()

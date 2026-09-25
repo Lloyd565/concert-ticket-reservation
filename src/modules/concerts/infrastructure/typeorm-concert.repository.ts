@@ -46,8 +46,6 @@ export class TypeOrmConcertRepository implements ConcertRepository {
   }
 
   async findByIdForUpdate(id: string): Promise<Concert | null> {
-    // pessimistic_write = SELECT ... FOR UPDATE: concurrent transactions that
-    // want this concert's row wait here until we commit or roll back.
     const row = await requireTransaction()
       .getRepository(ConcertOrmEntity)
       .findOne({ where: { id }, lock: { mode: 'pessimistic_write' } });
@@ -58,8 +56,6 @@ export class TypeOrmConcertRepository implements ConcertRepository {
     concertId: string,
     excludeReservationId?: string,
   ): Promise<number> {
-    // A separate statement after the lock: under READ COMMITTED each statement
-    // takes a fresh snapshot, so this sees every commit made before we got it.
     const qb = currentManager(this.dataSource)
       .getRepository(ReservationOrmEntity)
       .createQueryBuilder('r')
@@ -70,7 +66,6 @@ export class TypeOrmConcertRepository implements ConcertRepository {
       qb.andWhere('r.id <> :excludeReservationId', { excludeReservationId });
     }
     const result = await qb.getRawOne<{ reserved: string }>();
-    // SUM returns bigint, which pg hands back as a string.
     return Number(result?.reserved ?? 0);
   }
 }

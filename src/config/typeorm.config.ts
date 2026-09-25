@@ -2,8 +2,6 @@ import { join } from 'path';
 import { DataSourceOptions } from 'typeorm';
 import { EnvironmentVariables } from './env.validation';
 
-// Shared by the Nest app and the migration CLI so both see the same entities
-// and migrations. Schema only ever changes through migrations.
 export function buildDataSourceOptions(
   env: Pick<
     EnvironmentVariables,
@@ -20,7 +18,6 @@ export function buildDataSourceOptions(
     entities: [join(__dirname, '..', '**', '*.entity.{ts,js}')],
     migrations: [join(__dirname, '..', 'database', 'migrations', '*.{ts,js}')],
     synchronize: false,
-    // gen_random_uuid() is built into Postgres 13+; the default needs uuid-ossp.
     uuidExtension: 'pgcrypto',
   };
 }

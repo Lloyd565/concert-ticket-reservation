@@ -15,10 +15,6 @@ import { ReservationNotFoundError } from '../domain/reservation.errors';
 import { ReservationRepository } from '../domain/reservation.repository';
 import { ReservationsService } from './reservations.service';
 
-// The use case against in-memory fakes of its ports: no database, no Nest.
-// This is what the layering buys; the locking itself is covered by the e2e
-// concurrency test against real Postgres.
-
 class InMemoryReservations extends ReservationRepository {
   rows: Reservation[] = [];
 

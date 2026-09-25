@@ -22,7 +22,6 @@ export class AuthController {
   @Public()
   @Post('register')
   async register(@Body() dto: RegisterDto) {
-    // Explicit pick: passwordHash must never reach the response.
     const { id, email, role, createdAt } = await this.auth.register(
       dto.email,
       dto.password,

@@ -5,8 +5,6 @@ import { AuthenticatedUser } from '../../modules/auth/domain/authenticated-user'
 import { Role } from '../../modules/users/domain/role';
 import { ROLES_KEY } from '../decorators/roles.decorator';
 
-// Runs after JwtAuthGuard, so request.user is already set on protected routes.
-// Returning false makes Nest answer 403.
 @Injectable()
 export class RolesGuard implements CanActivate {
   constructor(private readonly reflector: Reflector) {}
