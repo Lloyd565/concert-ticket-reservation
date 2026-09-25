@@ -31,6 +31,11 @@ For a concert, the sum of ACTIVE reservation quantities never exceeds `capacity`
 - Capacity checks are pure functions in `src/modules/concerts/domain/capacity.ts`.
 - Another user's reservation is reported as 404, never 403.
 
+## Tests
+- Unit: `*.spec.ts` next to the code (`npm test`), no DB. Domain rules get unit tests.
+- E2E: `test/*.e2e-spec.ts` (`npm run test:e2e`, `--runInBand`) against real Postgres `concert_test` via `.env.test`; schema from migrations in `test/global-setup.ts`; `reset()` truncates between tests. `test/test-env.ts` refuses any `DB_NAME` not ending in `_test` — never weaken it.
+- Never mock the DB in a test about locking. The concurrency test only proves something if it FAILS with the `FOR UPDATE` removed: re-check that whenever you touch it (keep capacity well below one wave of parallel demand).
+
 ## Rules
 - Never `synchronize: true`; every schema change is a migration.
 - Config only from env vars, validated at boot in `src/config/env.validation.ts`.
