@@ -1,10 +1,21 @@
 import { ConfigService } from '@nestjs/config';
 import { NestFactory } from '@nestjs/core';
+import { DocumentBuilder, SwaggerModule } from '@nestjs/swagger';
 import { AppModule } from './app.module';
 import { EnvironmentVariables } from './config/env.validation';
 
 async function bootstrap() {
   const app = await NestFactory.create(AppModule);
+
+  // Served by Swagger's own route, outside the controller guards, so the docs
+  // page itself needs no token. Use "Authorize" to paste an access token.
+  const openApi = new DocumentBuilder()
+    .setTitle('Concert Ticket Reservation API')
+    .setVersion('1.0')
+    .addBearerAuth()
+    .build();
+  SwaggerModule.setup('docs', app, SwaggerModule.createDocument(app, openApi));
+
   const config = app.get(ConfigService<EnvironmentVariables, true>);
   await app.listen(config.get('PORT', { infer: true }));
 }

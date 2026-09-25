@@ -1,7 +1,7 @@
 # CLAUDE.md
 
 NestJS + TypeScript REST API (monolith) for concert ticket reservations, PostgreSQL via TypeORM.
-The task brief is `docs/assignment-brief.md`; work stage by stage and stop after each one.
+The task brief is `docs/assignment-brief.md`. User-facing docs: `README.md` (Bahasa Indonesia).
 `docs/archive/` is the retired Go microservices design (tag `go-microservices-p4`) — historical only, not rules for this code.
 
 ## Commands
@@ -9,7 +9,9 @@ The task brief is `docs/assignment-brief.md`; work stage by stage and stop after
 - `npm run start:dev` — run the API (needs `.env`, copy from `.env.example`)
 - `npm run migration:generate -- src/database/migrations/<Name>` / `migration:run` / `migration:revert`
   (prefix `ENV_FILE=.env.test` to target the test database)
-- `npm run lint`, `npm run build`, `npm test`, `npm run test:e2e`
+- `npm run lint` (CI, no fix) / `npm run lint:fix`, `npm run build`, `npm test`, `npm run test:e2e`
+- Swagger UI at `/docs` (CLI plugin in `nest-cli.json` reads DTOs; add `@ApiBearerAuth()` on protected routes)
+- CI: `.github/workflows/ci.yml` runs lint, build, unit and e2e against a Postgres service on 5433
 
 ## Layers (`src/modules/<feature>/`, enforced by `no-restricted-imports` in `eslint.config.mjs`)
 - `presentation/` controllers + DTOs. No business logic; may import application and domain.
