@@ -24,6 +24,13 @@ The task brief is `docs/assignment-brief.md`; work stage by stage and stop after
 - JWT is HS256 only (pinned on verify). `JwtStrategy` reloads the user by `sub`, so deleted users are rejected and roles come from the DB.
 - Register always creates `USER`; the only ADMIN comes from `ADMIN_EMAIL`/`ADMIN_PASSWORD` at startup (`AdminBootstrapService`).
 
+## Capacity invariant (do not weaken)
+For a concert, the sum of ACTIVE reservation quantities never exceeds `capacity`, even under concurrency.
+- Every write that changes seat accounting (create/resize/cancel reservation, change capacity, delete concert) runs in `TransactionRunner.run()` and calls `ConcertRepository.findByIdForUpdate()` (**SELECT … FOR UPDATE**) **first**, then reads `reservedSeats()` as a separate statement. Same lock, same order, every path.
+- `TransactionRunner` (`src/common/application/`) is the port; the TypeORM impl keeps the tx `EntityManager` in `AsyncLocalStorage`, repositories pick it up via `currentManager()`. `requireTransaction()` throws if a lock is taken outside a transaction.
+- Capacity checks are pure functions in `src/modules/concerts/domain/capacity.ts`.
+- Another user's reservation is reported as 404, never 403.
+
 ## Rules
 - Never `synchronize: true`; every schema change is a migration.
 - Config only from env vars, validated at boot in `src/config/env.validation.ts`.
