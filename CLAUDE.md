@@ -19,6 +19,11 @@ The task brief is `docs/assignment-brief.md`; work stage by stage and stop after
 - Domain errors extend `src/common/domain/domain-error.ts`; HTTP status is mapped only in `src/common/filters/domain-exception.filter.ts`.
 - Global pipe/filter are `APP_PIPE`/`APP_FILTER` providers in `AppModule` (not `main.ts`) so e2e tests get them too.
 
+## Auth
+- `JwtAuthGuard` + `RolesGuard` are global (`APP_GUARD`): every route needs a Bearer token unless marked `@Public()`; admin-only routes add `@Roles(Role.ADMIN)`.
+- JWT is HS256 only (pinned on verify). `JwtStrategy` reloads the user by `sub`, so deleted users are rejected and roles come from the DB.
+- Register always creates `USER`; the only ADMIN comes from `ADMIN_EMAIL`/`ADMIN_PASSWORD` at startup (`AdminBootstrapService`).
+
 ## Rules
 - Never `synchronize: true`; every schema change is a migration.
 - Config only from env vars, validated at boot in `src/config/env.validation.ts`.

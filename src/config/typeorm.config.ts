@@ -20,5 +20,7 @@ export function buildDataSourceOptions(
     entities: [join(__dirname, '..', '**', '*.entity.{ts,js}')],
     migrations: [join(__dirname, '..', 'database', 'migrations', '*.{ts,js}')],
     synchronize: false,
+    // gen_random_uuid() is built into Postgres 13+; the default needs uuid-ossp.
+    uuidExtension: 'pgcrypto',
   };
 }
